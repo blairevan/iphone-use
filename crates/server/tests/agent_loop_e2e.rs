@@ -368,13 +368,15 @@ fn metrics_runs_advice_and_cli_through_the_real_daemon() {
 
     let log = state_path.join("agent-runs.jsonl");
     let deadline = Instant::now() + Duration::from_secs(5);
-    // Earlier inferred runs may already have created the file. Wait for this
-    // run's complete JSON record, not merely the asynchronous writer's file.
+    // Earlier inferred runs may already have created the file. The persistent
+    // log deliberately pseudonymizes caller-owned text; use the run's unique
+    // incarnation and counters, not a raw owner or run id, to match its record.
     let persisted = loop {
         let summary = std::fs::read_to_string(&log).ok().and_then(|text| {
             text.lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .find(|record| record["key"]["run_id"] == "task-1")
+                .find(|record| record["key"]["kind"] == "explicit"
+                    && record["key"]["incarnation"] == ended["run"]["key"]["incarnation"])
         });
         if let Some(summary) = summary {
             break summary;
@@ -388,7 +390,12 @@ fn metrics_runs_advice_and_cli_through_the_real_daemon() {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    assert_eq!(persisted["key"]["owner"], "e2e-agent");
+    assert_ne!(persisted["key"]["owner"], "e2e-agent");
+    assert_ne!(persisted["key"]["run_id"], "task-1");
+    assert_eq!(persisted["tool_calls"], ended["run"]["tool_calls"]);
+    assert_eq!(persisted["model_round_trips"], ended["run"]["model_round_trips"]);
+    let persisted_text = std::fs::read_to_string(&log).unwrap();
+    assert!(!persisted_text.contains("e2e-agent") && !persisted_text.contains("task-1"));
 
     // The CLI reads the same metrics from the same daemon.
     let output = Command::new(env!("CARGO_BIN_EXE_iphone-use"))
@@ -654,7 +661,7 @@ fn an_explicit_run_with_no_model_turns_reports_zero() {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
         stream,
-        "GET /agent/screenshot HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\n\
+        "GET /agent/screenshot HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\n\
          X-Phone-Owner: runner-1\r\nX-Agent-Run: r1\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
@@ -698,7 +705,7 @@ fn a_real_flow_replay_counts_as_flow_calls() {
     let mut mcp = Mcp::start(daemon.port, &home_path);
     let out = mcp.call(
         "phone_flow_run",
-        serde_json::json!({"id": flow.to_string_lossy(), "force": true}),
+        serde_json::json!({"id": flow.to_string_lossy(), "force": true, "confirm": true}),
     );
     let (_, metrics) = http(
         daemon.port,
@@ -822,7 +829,7 @@ fn session_cookie(port: u16, password: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
         stream,
-        "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+        "POST /login HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )

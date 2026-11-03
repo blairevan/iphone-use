@@ -48,6 +48,15 @@ pub struct Config {
     /// public host with the tunnel routing by path. Normalized to `""` (none)
     /// or a leading-slash form without a trailing slash.
     pub base_path: String,
+    /// Explicit HTTPS entry point for QR codes and remote callbacks. Never
+    /// infer this trusted address from an unauthenticated Host header.
+    pub public_url: Option<String>,
+    /// Explicit transport peers permitted to supply an overwritten X-Real-IP.
+    pub trusted_proxy_ips: Vec<String>,
+    /// Explicit remote activation; a persisted profile may override legacy env.
+    pub remote_enabled: bool,
+    /// HTTPS/WSS relay selected explicitly by the operator.
+    pub relay_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +139,16 @@ impl Config {
             agent_token,
             device_udid,
             base_path,
+            public_url: get("IPHONE_USE_PUBLIC_URL").filter(|v| !v.trim().is_empty()),
+            trusted_proxy_ips: get("IPHONE_USE_TRUSTED_PROXY_IPS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            remote_enabled: get("IPHONE_USE_REMOTE_ACCESS").as_deref() == Some("1"),
+            relay_url: get("IPHONE_USE_RELAY_URL").filter(|s| !s.trim().is_empty()),
         }
     }
 }

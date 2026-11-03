@@ -81,7 +81,7 @@ private final class FixtureProtocol: URLProtocol, @unchecked Sendable {
 @main
 private struct Checks {
     static let publicURL = URL(string: "https://expired-tunnel.example")!
-    static let lanURL = URL(string: "http://192.0.2.4:44321")!
+    static let lanURL = URL(string: "https://192.0.2.4:44321")!
     static let proofKey = Data(repeating: 0x51, count: 32)
     static let cookie = ["Set-Cookie":"phone_session=synthetic-session; Path=/; Max-Age=28800"]
 
@@ -101,11 +101,49 @@ private struct Checks {
         precondition(request.httpBody == nil)
         let nonce = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
             .queryItems!.first { $0.name == "n" }!.value!
-        let signed = HMAC<SHA256>.authenticationCode(for: Data(nonce.utf8), using: SymmetricKey(data: proofKey))
+        let base = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+            .queryItems!.first { $0.name == "u" }!.value!
+        let message = "iphone-use-route-v2\n\(nonce)\n\(base)"
+        let signed = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: proofKey))
         return .http(200, "{\"proof\":\"\(Data(signed).base64URL)\"}")
     }
 
     static func main() async throws {
+        let plainLAN = URL(string: "http://192.0.2.4:44321")!
+        let secure = client()
+        precondition(!secure.use(plainLAN))
+        precondition(secure.base == publicURL)
+        precondition(!DaemonClient.permitsRedirect(from: publicURL, to: URL(string: "http://expired-tunnel.example")!))
+        precondition(!DaemonClient.permitsRedirect(from: publicURL, to: URL(string: "https://unrelated.example")!))
+        precondition(DaemonClient.permitsRedirect(from: publicURL, to: publicURL.appendingPathComponent("phone")))
+        print("PASS: paired HTTPS cannot downgrade or redirect credentials to another origin")
+        let noProbe = URLSessionConfiguration.ephemeral
+        noProbe.protocolClasses = [FixtureProtocol.self]
+        FixtureProtocol.handler.withLock { $0 = { _ in fatalError("plaintext candidate must not be probed") } }
+        let refused = DaemonClient(base: publicURL, lanCandidates: [plainLAN], lanKey: proofKey,
+                                   configuration: noProbe, probeConfiguration: noProbe)
+        let plaintextCandidate = await refused.probeLAN()
+        precondition(plaintextCandidate == nil)
+        print("PASS: discovery never selects plaintext LAN even with a pairing proof key")
+        FixtureProtocol.handler.withLock { handler in handler = { request in
+            let nonce = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+                .queryItems!.first { $0.name == "n" }!.value!
+            let signed = HMAC<SHA256>.authenticationCode(for: Data(nonce.utf8), using: SymmetricKey(data: proofKey))
+            return .http(200, "{\"proof\":\"\(Data(signed).base64URL)\"}")
+        } }
+        let legacyProof = await client().provesIdentity(at: lanURL, key: proofKey)
+        precondition(!legacyProof, "a forwarded nonce-only proof cannot authorize a new origin")
+        print("PASS: legacy nonce-only proofs cannot authorize credential migration")
+        let revocationStore = UserDefaults(suiteName: "iphone-use-revocation-fixture-\(UUID().uuidString)")!
+        let revokedAddress = "https://revoked.example/fixture"
+        PairingRevocation.mark(address: revokedAddress, defaults: revocationStore)
+        precondition(PairingRevocation.requiresAuthorization(address: revokedAddress, freshCredential: false, defaults: revocationStore))
+        precondition(!PairingRevocation.requiresAuthorization(address: revokedAddress, freshCredential: true, defaults: revocationStore))
+        // Merely presenting a new credential does not clear the stored latch.
+        precondition(PairingRevocation.requiresAuthorization(address: revokedAddress, freshCredential: false, defaults: revocationStore))
+        PairingRevocation.authorized(address: revokedAddress, defaults: revocationStore)
+        precondition(!PairingRevocation.requiresAuthorization(address: revokedAddress, freshCredential: false, defaults: revocationStore))
+        print("PASS: revocation persists until fresh user authorization, not a network retry")
         let events = LockedState<[String]>(initialState: [])
         FixtureProtocol.handler.withLock { handler in handler = { request in
             let url = request.url!

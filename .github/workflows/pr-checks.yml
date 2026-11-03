@@ -54,6 +54,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash scripts/test-remote-connection.sh
 
+  relay-security:
+    name: Relay transport and admission boundaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: relay
+      - run: bash scripts/test-relay-security.sh
+
   test:
     name: Tests and MCP tool discovery
     # Same image as the release build, so a failure here means the code, not a
@@ -162,6 +172,31 @@ jobs:
           name: action-target-protocol
           if-no-files-found: ignore
           path: ${{ runner.temp }}/action-target-protocol
+
+      - name: Real HTTPS, pairing and revocation boundaries (no device)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/test-security-protocol.py --daemon target/debug/iphone-use \
+            --report "$RUNNER_TEMP/security-protocol.json"
+
+      - name: Installer migration and notification-only updater policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/test-install-security-policy.py
+          python3 -I scripts/test-release-bundle.py
+          python3 -I scripts/test-auto-update.py
+          bash scripts/test-install-auto-update.sh
+          bash scripts/test-install-legacy-plist.sh
+
+      - name: Preserve security protocol receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: security-protocol
+          if-no-files-found: ignore
+          path: ${{ runner.temp }}/security-protocol.json
 
       - name: cargo test -p iphone-use-mcp
         timeout-minutes: 15

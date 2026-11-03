@@ -247,11 +247,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Upgrade to the latest GitHub release (daemon app and agent skill).
-    ///
-    /// Runs the same install.sh the daemon was installed with, then refreshes
-    /// any other copy of the skill (Claude Code plugin, git checkout). Exit 0
-    /// on success or when already current, 2 when the check or download fails.
+    /// Check for releases. Never installs software or refreshes executable skills.
     Upgrade {
         /// Change nothing; print `iphone-use <current> -> <latest>` or
         /// `iphone-use <current> is up to date`.
@@ -260,6 +256,16 @@ enum Command {
         /// Like --check, as JSON: name, current, latest, update_available, skills.
         #[arg(long)]
         json: bool,
+    },
+    /// Manage independently trusted, signed offline release bundles.
+    Release {
+        #[command(subcommand)]
+        action: server::release::Action,
+    },
+    /// Explicitly configure, verify or close an authenticated HTTPS entry point.
+    Remote {
+        #[command(subcommand)]
+        action: server::remote_access::Action,
     },
     /// Build, install and start the device runner on the connected iPhone.
     ///
@@ -464,52 +470,6 @@ fn update_notice() {
     );
 }
 
-/// Is `program` an executable somewhere on `$PATH`?
-fn on_path(program: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            std::fs::metadata(dir.join(program))
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-    })
-}
-
-/// Download install.sh into a private temp dir, then run it the way the
-/// documented `curl … | sh` does (script on stdin, so it behaves as a piped
-/// install rather than a local checkout). Downloading first means a failed
-/// fetch is reported, not silently piped into `sh` as an empty script.
-fn run_installer() -> std::result::Result<(), String> {
-    use server::update;
-    let dir = tempfile::tempdir().map_err(|e| format!("could not create a temp dir: {e}"))?;
-    let script = dir.path().join("install.sh");
-    let fetched = std::process::Command::new("curl")
-        .args(["-fsSL", "--proto", "=https", "-o"])
-        .arg(&script)
-        .arg(update::INSTALL_SCRIPT_URL)
-        .status()
-        .map_err(|e| format!("could not run curl: {e}"))?;
-    if !fetched.success() {
-        return Err(format!(
-            "downloading {} failed ({fetched}); nothing was changed",
-            update::INSTALL_SCRIPT_URL
-        ));
-    }
-    let stdin = std::fs::File::open(&script)
-        .map_err(|e| format!("could not open the downloaded installer: {e}"))?;
-    let status = std::process::Command::new("/bin/sh")
-        .stdin(stdin)
-        .status()
-        .map_err(|e| format!("could not run install.sh: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "install.sh failed ({status}); it restores the previous install on failure"
-        ))
-    }
-}
-
 /// `iphone-use upgrade [--check] [--json]`. Returns the process exit code.
 fn upgrade(check_only: bool, json: bool) -> i32 {
     use server::update;
@@ -548,55 +508,8 @@ fn upgrade(check_only: bool, json: bool) -> i32 {
         return 0;
     }
 
-    let mut installer_ran = false;
-    if report.update_available {
-        let exe = std::env::current_exe()
-            .and_then(std::fs::canonicalize)
-            .unwrap_or_default();
-        if !update::installed_by_installer(&exe) {
-            // A cargo build or other copy: never replace ~/Applications behind
-            // its back. Say how instead.
-            println!("{}", report.summary());
-            println!(
-                "this binary ({}) was not installed by install.sh; rebuild it from source, \
-                 or install the release with:\n  {}",
-                exe.display(),
-                update::INSTALL_COMMAND
-            );
-            return 0;
-        }
-        println!(
-            "iphone-use: upgrading {} -> {} with install.sh (the daemon restarts)",
-            report.current,
-            report.latest.as_deref().unwrap_or("?")
-        );
-        if let Err(error) = run_installer() {
-            eprintln!("iphone-use: {error}");
-            return 2;
-        }
-        installer_ran = true;
-        println!(
-            "iphone-use upgraded {} -> {}",
-            report.current,
-            report.latest.as_deref().unwrap_or("?")
-        );
-    } else {
-        println!("{}", report.summary());
-    }
-
-    let mut run = |program: &str, args: &[String]| {
-        std::process::Command::new(program)
-            .args(args)
-            .status()
-            .map(|status| status.success())
-    };
-    let _ = update::refresh_skills(
-        &report.skills,
-        installer_ran,
-        on_path("claude"),
-        &mut run,
-        &mut std::io::stdout(),
-    );
+    let _ = report.write_text(&mut std::io::stdout());
+    println!("Notification only. No app, runner, plugin or skill was changed. Use `iphone-use release verify <bundle>` then `release install <bundle> --confirm` with an independently provisioned trust root.");
     0
 }
 
@@ -647,7 +560,7 @@ fn open_console() -> Result<()> {
     }
     let url = format!("http://127.0.0.1:{port}/phone");
     if !answering() {
-        let install = "curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh";
+        let install = "iphone-use release install <verified-local-bundle> --confirm";
         let message = if server::locale::prefers_chinese() {
             format!("iphone-use 服务没有运行（127.0.0.1:{port} 无响应）。请重新运行安装命令：\n{install}")
         } else {
@@ -840,6 +753,7 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
+        .event_format(server::safe_log::PrivacyFormatter)
         .init();
 
     // Older Launch Services hands a Finder launch a `-psn_…` argument.
@@ -933,6 +847,8 @@ fn main() -> Result<()> {
             )),
         Command::Device { query } => std::process::exit(device_query(query)),
         Command::Upgrade { check, json } => std::process::exit(upgrade(check || json, json)),
+        Command::Release { action } => server::release::run(action),
+        Command::Remote { action } => server::remote_access::run(action),
         Command::Setup { instance, args } => {
             // `setup pause --instance i13`: clap's trailing args swallow a
             // flag written after the subcommand, which silently fell back to
@@ -1092,7 +1008,7 @@ fn main() -> Result<()> {
 fn serve() -> Result<()> {
     // 1. Resolve the backend before touching any Mac capture/input API. Direct is
     //    the default and must start without Screen Recording or Accessibility.
-    let cfg = Config::from_env();
+    let mut cfg = Config::from_env();
     // Which daemon this is (#67): pin the instance before anything derives a
     // path or a launchd label from it.
     let instance = server::instance::install(
@@ -1101,6 +1017,9 @@ fn serve() -> Result<()> {
     instance
         .verify_on_disk()
         .map_err(|error| anyhow::anyhow!(error))?;
+    server::remote_access::apply(&mut cfg, &instance.state_dir)?;
+    server::security::validate_startup(&cfg, cfg.remote_enabled, cfg.relay_url.is_some())
+        .map_err(anyhow::Error::msg)?;
     tracing::info!(
         "instance {} (state_dir={}, runner_label={})",
         instance.name,
@@ -1172,7 +1091,7 @@ fn serve() -> Result<()> {
         managed_runner,
         managed_runner_pending,
         simulator: simulator.clone(),
-    });
+    })?;
 
     run_server(cfg, state, dir)
 }
@@ -1281,6 +1200,8 @@ fn run_server(cfg: Config, state: Arc<AppState>, runtime_dir: std::path::PathBuf
         let listener = tokio::net::TcpListener::bind((socket_host(&cfg.host), cfg.port))
             .await
             .with_context(|| format!("bind {authority}"))?;
+        server::security::validate_bound_address(&cfg, listener.local_addr()?)
+            .map_err(anyhow::Error::msg)?;
         let pid_record = write_pid(&runtime_dir)?;
 
         print_startup_banner(&cfg);
@@ -1342,11 +1263,12 @@ fn run_server(cfg: Config, state: Arc<AppState>, runtime_dir: std::path::PathBuf
         }
 
         // The cloud relay, when configured: reach this daemon from anywhere.
-        if let Some(relay) = std::env::var("IPHONE_USE_RELAY_URL").ok().filter(|v| !v.is_empty()) {
-            server::relay_client::spawn(move || Some(relay.clone()), server::instance::current().state_dir.clone(), cfg.port);
+        if let Some(relay) = cfg.relay_url.clone() {
+            server::relay_client::spawn(move || Some(relay.clone()), server::instance::current().state_dir.clone(), cfg.port,
+                core::auth::sign(&state.secret, "relay-ingress-v1"), state.public_url.clone());
         }
         let app = http::router(state);
-        let serve_result = axum::serve(listener, app)
+        let serve_result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("axum serve");
@@ -1367,14 +1289,14 @@ fn print_startup_banner(cfg: &Config) {
     eprintln!("   url:      {url}");
     match &cfg.password {
         Some(_) => eprintln!("   password: (set via IPHONE_USE_PASSWORD)"),
-        None => eprintln!("   password: (none — open LAN mode)"),
+        None => eprintln!("   password: (none — local development mode)"),
     }
     match &cfg.agent_token {
         Some(_) => eprintln!("   agent:    (dedicated token set via IPHONE_USE_AGENT_TOKEN)"),
         None => eprintln!("   agent:    (no dedicated token — uses password for bearer auth)"),
     }
     if cfg.host == "127.0.0.1" {
-        eprintln!("   note:     bound to 127.0.0.1; set IPHONE_USE_HOST=0.0.0.0 for LAN access");
+        eprintln!("   note:     local-only; remote access requires an explicitly configured authenticated HTTPS entry point");
     }
     eprintln!("──────────────────────────────────────────────");
 }
@@ -1889,6 +1811,10 @@ mod tests {
             agent_token: None,
             device_udid: None,
             base_path: String::new(),
+            public_url: None,
+            trusted_proxy_ips: Vec::new(),
+            remote_enabled: false,
+            relay_url: None,
         }
     }
 

@@ -143,10 +143,10 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Install iphone-use (no device setup, no MCP client registration)
+      - name: Use the pre-provisioned, reviewed iphone-use installation
         run: |
-          curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh \
-            | IPHONE_USE_NO_SETUP=1 IPHONE_USE_NO_CLIENT_SETUP=1 sh
+          test -x "$HOME/.local/bin/iphone-use"  # reviewed, pre-provisioned runner
+          "$HOME/.local/bin/iphone-use" upgrade --check
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Boot a simulator, start the runner and the daemon
         run: iphone-use simulator start "iPhone 15" --instance ci-sim

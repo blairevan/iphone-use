@@ -430,7 +430,7 @@ final class UnifiedAssistant: ObservableObject {
               native?.pendingConfirm == expected, native?.steps.count == expectedSteps,
               let api = local?.client else { return }
         let nativeID = taskID
-        Task { do { try await api.answer(task: nativeID, approve: approve) } catch { message = error.localizedDescription } }
+        Task { do { try await api.answer(task: nativeID, approve: approve, confirmationID: expected.confirmationID) } catch { message = error.localizedDescription } }
     }
     func pause() async {
         let pausingTaskID = task?.id

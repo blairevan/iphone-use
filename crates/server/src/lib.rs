@@ -2,11 +2,13 @@ pub mod activity;
 pub mod advice;
 pub mod afc;
 pub mod app_lookup;
-pub mod boot;
 pub mod apps;
+pub mod boot;
+pub mod browser_boundary;
 pub mod collect;
 pub mod config;
 pub mod crash;
+pub mod credentials;
 pub mod device_identity;
 pub mod flows;
 pub mod focus;
@@ -35,11 +37,17 @@ pub mod protocol;
 pub mod recording;
 pub mod redaction;
 pub mod relay_client;
+pub mod release;
+pub mod remote_access;
+pub mod runner;
 pub mod runner_token;
 pub mod runtime_dir;
 pub mod schedules;
 pub mod scope;
 pub mod scroll_progress;
+pub mod secure_store;
+pub mod security;
+pub mod security_http;
 pub mod setup;
 pub mod simulator;
 pub mod syslog;
@@ -50,7 +58,6 @@ pub mod tunnel;
 pub mod update;
 pub mod usbmux;
 pub mod video;
-pub mod runner;
 
 /// Re-export of the `core` crate under a non-`core` name.
 ///
@@ -60,4 +67,5 @@ pub mod runner;
 /// `core::`-emitting macro (e.g. `#[tokio::test]`). Reaching the core types
 /// through this alias avoids that footgun.
 pub use ::core as core_crate;
+pub use iphone_use_mcp::safe_log;
 pub mod observation;

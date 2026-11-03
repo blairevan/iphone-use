@@ -396,8 +396,14 @@ final class AppModel: ObservableObject {
         defer { adding = false }
         let old = devices[index].address
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var migrated: (client: DaemonClient, status: PhoneStatus)?
         if !DeviceStore.same(old, address) {
-            session.disconnect()
+            do { migrated = try await session.prepareMigration(to: base) }
+            catch { return .rejected(error.localizedDescription, canSaveAnyway: false) }
+            guard devices.indices.contains(index), devices[index].id == id,
+                  devices[index].address == old else {
+                return .rejected(String(localized: "设备设置已更改，请重新打开后再试。"), canSaveAnyway: false)
+            }
             guard DeviceSession.moveCredentials(from: old, to: address) else {
                 return .rejected(String(localized: "连接信息未能保存，请解锁这台手机后重试。原来的登录信息已保留。"), canSaveAnyway: false)
             }
@@ -408,7 +414,10 @@ final class AppModel: ObservableObject {
             ? DeviceStore.defaultName(for: address) : trimmed
         session.record = devices[index]
         persist()
-        if password.isEmpty {
+        if let migrated {
+            do { try await session.adopt(migrated.client, verifiedStatus: migrated.status) }
+            catch { return .saved(id, Self.problem(of: session)) }
+        } else if password.isEmpty {
             await session.connect(password: nil)
         } else {
             await session.connect(password: password)

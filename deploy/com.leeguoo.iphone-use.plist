@@ -57,11 +57,10 @@
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
-        <!-- Remote browsers/agents reach the daemon over the LAN, so this
-             template binds 0.0.0.0. A password is mandatory for that binding;
-             install.sh generates one when none is supplied. -->
+        <!-- Local-only by default. Provision authenticated HTTPS and distinct
+             credentials before explicitly enabling any remote exposure. -->
         <key>IPHONE_USE_HOST</key>
-        <string>0.0.0.0</string>
+        <string>127.0.0.1</string>
         <key>IPHONE_USE_PORT</key>
         <string>44321</string>
         <key>IPHONE_USE_PASSWORD</key>

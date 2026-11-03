@@ -7,6 +7,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 import json
+import subprocess
 import tempfile
 from types import SimpleNamespace
 
@@ -85,6 +86,60 @@ class VerdictTests(unittest.TestCase):
         for key, value in [("text", ""), ("text", "照"), ("text", "照片照片"), ("began_editing", 0),
                            ("began_editing", True), ("selections", [3]), ("run_id", "old")]:
             self.assertTrue(check.judge_input(dict(record, **{key: value}), "fresh", "typing", 3))
+
+    def test_fixture_flow_explicitly_confirms_exactly_one_dispatch(self):
+        """Both flow carriers must authorize their owned fixture without replay."""
+        for carrier, hover in [("multi-flow", False), ("flow", True)]:
+            with self.subTest(carrier=carrier), tempfile.TemporaryDirectory() as root:
+                args = SimpleNamespace(out=Path(root), udid="owned-simulator",
+                                       mcp=Path("/fixture/iphone-use-mcp"))
+                flow_calls = []
+                dispatched = False
+
+                def require_simulator(udid):
+                    """Keep the real case's target checks bound to this fixture."""
+                    self.assertEqual(udid, "owned-simulator")
+
+                def metrics(nonce, ended=False):
+                    """Model independent UI receipts only after an accepted send."""
+                    record = {"run_id": nonce, "width": 393, "height": 852,
+                              "down_count": 0, "up_count": 0, "cancel_count": 0}
+                    if not ended or not dispatched:
+                        return record
+                    if carrier == "multi-flow":
+                        record.update({"down_count": 3, "up_count": 3, "max_fingers": 3,
+                                       "holds": [{"start": [x, 0.4], "end": [x, 0.4],
+                                                  "duration_ms": 1500} for x in (0.3, 0.5, 0.7)]})
+                    else:
+                        record.update({"down_count": 1, "up_count": 1, "max_fingers": 1,
+                                       "hover_ms": 900, "duration_ms": 1900, "initial_hold_ms": 400,
+                                       "start": [0.3, 0.4], "end": [0.5, 0.4],
+                                       "visits": ["start", "edge", "end"]})
+                    return record
+
+                def command(argv, env=None, check=True, timeout=180):
+                    """Stub external processes, enforcing the CLI approval contract."""
+                    nonlocal dispatched
+                    if argv[0] == args.mcp:
+                        flow_calls.append([str(arg) for arg in argv])
+                        if "--confirm" not in argv:
+                            return subprocess.CompletedProcess(
+                                argv, 1, "", "flow has no local approval; use --confirm")
+                        dispatched = True
+                        return subprocess.CompletedProcess(argv, 0, '{"ok":true}', "")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                # Only external process/device boundaries are replaced; case,
+                # flow serialization, acknowledgement parsing and verdicts run.
+                daemon = SimpleNamespace(base="http://127.0.0.1:44321", owner="fixture",
+                                         require_simulator=require_simulator, wait_metrics=metrics)
+                with patch.object(check, "command", command), patch.object(
+                        check, "runner_call", return_value=({"value": {"width": 393, "height": 852}}, {})), \
+                        patch("sys.stdout", new_callable=io.StringIO):
+                    report = check.case(daemon, args, carrier, carrier, hover)
+                self.assertTrue(report["passed"], report["errors"])
+                self.assertEqual(len(flow_calls), 1)
+                self.assertIn("--confirm", flow_calls[0])
 
     def test_multi_hold_requires_three_simultaneous_stationary_full_duration_touches(self):
         record = {"run_id": "fresh", "down_count": 3, "up_count": 3, "cancel_count": 0,

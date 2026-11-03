@@ -2,14 +2,14 @@
 # install.sh — install iPhoneUse.app and register the GUI-session LaunchAgent
 #
 # USAGE (recommended — no auth required; GITHUB_TOKEN not needed for public releases):
-#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+#   iphone-use release install /path/to/verified-bundle --confirm
 #
 # Local / dev usage (skip download; supply a pre-built .app):
 #   ./install.sh /path/to/iPhoneUse.app
 #
 # A second phone, driven by its own daemon (#67):
 #   ./install.sh --instance NAME --udid <UDID> [--port N] [/path/to/iPhoneUse.app]
-#   curl -fsSL .../install.sh | sh -s -- --instance NAME --udid <UDID>
+#   ./install.sh --instance NAME --udid <UDID> /path/to/iPhoneUse.app
 # A named instance gets its own copy of the app, state dir
 # (~/.iphone-use/instances/NAME), launchd labels, token and ports. It never
 # touches the default instance or the shared app; then run its setup-runner.sh.
@@ -1189,7 +1189,7 @@ probe_launchd_daemon() {
         >/dev/null 2>&1 || return 1
     if [ -n "$token" ]; then
         # The token goes to curl on stdin as config, never in argv.
-        printf 'header = "Authorization: Bearer %s"\n' "$token" \
+        curl_auth_config "$token" \
             | curl -fsS --noproxy '*' -m 2 -o /dev/null -K - "$url" 2>/dev/null \
             || return 1
     else
@@ -1363,28 +1363,7 @@ EOF
 }
 
 download_verified_release_app() {
-    local ref="$1"
-    local destination="$2"
-    local asset_url="https://github.com/$REPO/releases/download/$ref/${APP_NAME}.zip"
-    local zip="$destination/${APP_NAME}.zip"
-    local checksum="$zip.sha256"
-    local expected
-    local actual
-
-    mkdir -p "$destination"
-    info "Downloading $asset_url ..."
-    curl -fsSL "$asset_url" -o "$zip"
-    curl -fsSL "${asset_url}.sha256" -o "$checksum" \
-        || die "Release $ref is missing the required ${APP_NAME}.zip.sha256 file."
-    expected="$(awk 'NR == 1 { print $1 }' "$checksum")"
-    printf '%s' "$expected" | grep -Eq '^[0-9A-Fa-f]{64}$' \
-        || die "Release $ref has an invalid SHA-256 checksum file."
-    actual="$(shasum -a 256 "$zip" | awk '{print $1}')"
-    [ "$actual" = "$expected" ] \
-        || die "SHA-256 mismatch for release $ref (expected $expected, got $actual)."
-    ok "SHA-256 verified for release $ref"
-
-    extract_verified_release_app_archive "$ref" "$zip" "$destination"
+    die "Unsigned network installation is disabled. Verify a complete local bundle with iphone-use release verify, then use release install --confirm. No remote code was executed."
 }
 
 # ── Device runner sources ─────────────────────────────────────────────────────
@@ -1419,24 +1398,7 @@ runner_tree_valid() {
 # Returns 1 (without dying) only when the release has no such asset, so a
 # release that predates the device runner can still be installed.
 download_verified_release_runner() {
-    local ref="$1"
-    local destination="$2"
-    local asset_url="https://github.com/$REPO/releases/download/$ref/$RUNNER_ASSET_NAME"
-    local tarball="$destination/$RUNNER_ASSET_NAME"
-    local expected actual
-    mkdir -p "$destination"
-    info "Downloading $asset_url ..."
-    curl -fsSL "$asset_url" -o "$tarball" 2>/dev/null || return 1
-    curl -fsSL "${asset_url}.sha256" -o "$tarball.sha256" \
-        || die "Release $ref is missing the required $RUNNER_ASSET_NAME.sha256 file."
-    expected="$(awk 'NR == 1 { print $1 }' "$tarball.sha256")"
-    printf '%s' "$expected" | grep -Eq '^[0-9A-Fa-f]{64}$' \
-        || die "Release $ref has an invalid $RUNNER_ASSET_NAME checksum file."
-    actual="$(shasum -a 256 "$tarball" | awk '{print $1}')"
-    [ "$actual" = "$expected" ] \
-        || die "SHA-256 mismatch for $RUNNER_ASSET_NAME in release $ref (expected $expected, got $actual)."
-    extract_verified_runner_archive "$ref" "$tarball" "$destination"
-    ok "SHA-256 verified for the release's device runner sources"
+    die "Unsigned network installation is disabled. Verify a complete local bundle with iphone-use release verify, then use release install --confirm. No remote code was executed."
 }
 
 # Only a runner/ tree, no absolute or parent paths, no links of any kind.
@@ -1532,10 +1494,7 @@ resolve_runner_source() {
         RUNNER_SOURCE_DIR="$SCRIPT_DIR/runner"
         return 0
     fi
-    ensure_release_ref
-    RUNNER_SRC_DL="$(mktemp -d)"
-    download_verified_release_runner "$RELEASE_REF" "$RUNNER_SRC_DL" || return 1
-    RUNNER_SOURCE_DIR="$RUNNER_SRC_DL/runner"
+    die "Local release is missing runner sources; network fallback is disabled."
 }
 
 _restore_runner_sources() {
@@ -2111,23 +2070,7 @@ _commit_skill_transaction() {
 }
 
 install_pinned_skill() {
-    local ref="$1"
-    local commit="$2"
-    local raw_url
-    validate_release_ref "$ref" \
-        || die "Cannot install an agent skill for unsafe release ref '$ref'."
-    validate_release_commit "$commit" \
-        || die "Cannot install an agent skill without an exact release commit."
-    raw_url="https://raw.githubusercontent.com/$REPO/$commit/skills/iphone-use/SKILL.md"
-    _ensure_skill_namespace
-    SKILL_EXPECTED_DL="$(mktemp "$HOME/.iphone-use/skill-source.XXXXXX")" \
-        || die "Could not stage the release-matched agent skill."
-    info "Fetching the agent skill from release $ref commit $commit ..."
-    curl -fsSL "$raw_url" -o "$SKILL_EXPECTED_DL" \
-        || die "Could not fetch the agent skill from release $ref commit $commit."
-    _install_verified_skill "$SKILL_EXPECTED_DL" "$ref" "$commit" "release"
-    rm -f "$SKILL_EXPECTED_DL"
-    SKILL_EXPECTED_DL=""
+    die "Unsigned network installation is disabled. Verify a complete local bundle with iphone-use release verify, then use release install --confirm. No remote code was executed."
 }
 
 install_local_skill() {
@@ -2252,94 +2195,93 @@ prepare_companion_skill() {
 }
 
 bootstrap_pinned_installer() {
-    local ref
-    local commit
-    local raw_base
-    local helper_dir
-    local asset_dir
-    local inner_status
+    die "Unsigned network installation is disabled. Verify a complete local bundle with iphone-use release verify, then use release install --confirm. No remote code was executed."
+}
 
-    [ "$#" -eq 0 ] \
-        || die "A local app path is accepted only when install.sh itself is run from a local file."
-    ref="$(resolve_release_ref)"
-    commit="$(resolve_release_commit "$ref")"
-    raw_base="https://raw.githubusercontent.com/$REPO/$commit"
-    BOOTSTRAP_TMP="$(mktemp -d)"
-    helper_dir="$BOOTSTRAP_TMP/helpers"
-    asset_dir="$BOOTSTRAP_TMP/asset"
-    mkdir -m 700 "$helper_dir" "$asset_dir"
-    mkdir -m 700 "$helper_dir/scripts"
+# Read security settings without executing anything supplied by the old install.
+network_setting() {
+    local key="$1" plist="$2" value=""
+    value="$(printenv "$key" 2>/dev/null || true)"
+    if [ -z "$value" ] && [ -f "$plist" ]; then
+        value="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$key" "$plist" 2>/dev/null || true)"
+        [ -n "$value" ] || value="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:PHONE_REMOTE_${key#IPHONE_USE_}" "$plist" 2>/dev/null || true)"
+    fi
+    printf '%s' "$value"
+}
 
-    info "Pinning release $ref raw helpers to commit $commit ..."
-    curl -fsSL "$raw_base/install.sh" -o "$helper_dir/install.sh"
-    curl -fsSL "$raw_base/uninstall.sh" -o "$helper_dir/uninstall.sh"
-    curl -fsSL "$raw_base/scripts/sign.sh" -o "$helper_dir/scripts/sign.sh"
-    curl -fsSL "$raw_base/scripts/setup-runner.sh" -o "$helper_dir/scripts/setup-runner.sh"
-    [ -s "$helper_dir/install.sh" ] \
-        && [ -s "$helper_dir/uninstall.sh" ] \
-        && [ -s "$helper_dir/scripts/sign.sh" ] \
-        && [ -s "$helper_dir/scripts/setup-runner.sh" ] \
-        || die "Release $ref is incomplete; refusing a mixed-version install."
-    if ! /bin/bash -n "$helper_dir/install.sh" \
-        || ! /bin/bash -n "$helper_dir/uninstall.sh" \
-        || ! /bin/bash -n "$helper_dir/scripts/sign.sh" \
-        || ! /bin/bash -n "$helper_dir/scripts/setup-runner.sh"; then
-        die "Release $ref contains a shell script that failed syntax validation."
-    fi
-    # Optional: without it the inner installer leaves automatic upgrades as they are.
-    if ! curl -fsSL "$raw_base/scripts/auto-update.sh" -o "$helper_dir/scripts/auto-update.sh" \
-        || ! /bin/bash -n "$helper_dir/scripts/auto-update.sh"; then
-        rm -f "$helper_dir/scripts/auto-update.sh"
-    fi
-    download_verified_release_app "$ref" "$asset_dir"
-    # A release whose setup-runner.sh builds the device runner ships its sources
-    # as a verified asset; the inner installer then finds them next to itself.
-    if grep -q 'IPhoneUseRunner' "$helper_dir/scripts/setup-runner.sh"; then
-        download_verified_release_runner "$ref" "$helper_dir" \
-            || die "Release $ref is missing $RUNNER_ASSET_NAME; refusing a mixed-version install."
-    fi
-    ok "Raw helper scripts pinned to exact commit $commit"
+# Never expose credentials in curl's process arguments or admit a second config
+# directive through a newline. Shell-function arguments are not child argv.
+curl_auth_config() {
+    local token="$1"
+    case "$token" in *$'\n'*|*$'\r'*) return 1 ;; esac
+    token="${token//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    printf 'header = "Authorization: Bearer %s"\n' "$token"
+}
 
-    if [ "${IPHONE_USE_SKIP_SKILL:-0}" = "1" ]; then
-        warn "Agent skill synchronization explicitly disabled (IPHONE_USE_SKIP_SKILL=1)."
-        warn "The daemon may not match an existing skill; no compatibility claim will be made."
-    else
-        install_pinned_skill "$ref" "$commit"
-    fi
+# Reject incompatible legacy network settings BEFORE staging files or stopping
+# a daemon. The operator must first provision a secure route and migrate clients.
+preflight_remote_migration() {
+    python3 - "$1" "$HOME" "$INSTANCE_NAME" <<'PY_POLICY'
+import ipaddress, json, os, pathlib, plistlib, stat, sys
 
-    # Defer outer-shell signals until the inner installer has either rolled
-    # itself back or returned success and the matching skill is committed.
-    # This closes the success-boundary window where a signal could otherwise
-    # restore the old skill after the new daemon had already committed.
-    BOOTSTRAP_SIGNAL_PENDING=0
-    trap 'BOOTSTRAP_SIGNAL_PENDING=1' HUP INT TERM
-    if IPHONE_USE_INSTALLER_PINNED=1 \
-        IPHONE_USE_RELEASE_REF="$ref" \
-        IPHONE_USE_RELEASE_COMMIT="$commit" \
-        IPHONE_USE_SKIP_SKILL=1 \
-        IPHONE_USE_SKILL_VERIFIED_BY_BOOTSTRAP="$SKILL_SYNCED" \
-        IPHONE_USE_SKILL_SHA256="$SKILL_SYNC_SHA256" \
-        /bin/bash "$helper_dir/install.sh" "$asset_dir/$APP_NAME" \
-        ${INSTANCE_FORWARD_ARGS[@]+"${INSTANCE_FORWARD_ARGS[@]}"}; then
-        inner_status=0
-    else
-        inner_status=$?
-    fi
-    if [ "$inner_status" -eq 0 ]; then
-        _commit_skill_transaction
-        if [ "$SKILL_SYNCED" = "1" ]; then
-            ok "Daemon install and release-matched agent skill committed together: $ref ($commit)"
-            info "Verified skill SHA-256: $SKILL_SYNC_SHA256"
-        else
-            warn "Daemon install committed with agent-skill synchronization explicitly disabled."
-        fi
-    fi
-    trap 'exit 130' HUP INT TERM
-    if [ "$BOOTSTRAP_SIGNAL_PENDING" = "1" ]; then
-        exit 130
-    fi
-    [ "$inner_status" -eq 0 ] || exit "$inner_status"
-    exit 0
+def fail():
+    sys.exit("Remote-access migration required BEFORE upgrading: provision an authenticated HTTPS entry point, explicit remote opt-in and separate non-empty human/agent credentials. The existing daemon has not been replaced or stopped.")
+
+def loopback(value):
+    try:
+        return value.lower() == 'localhost' or ipaddress.ip_address(value.strip('[]')).is_loopback
+    except ValueError:
+        return False
+
+def secure_url(value, relay=False):
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(value)
+        return (len(value) <= 2048 and value == value.strip() and not any(ord(c) < 32 for c in value)
+                and u.scheme in (('https', 'wss') if relay else ('https',))
+                and bool(u.hostname) and u.username is None and u.password is None
+                and not u.query and not u.fragment and '%' not in u.path and '//' not in u.path
+                and (u.port is None or 0 < u.port < 65536))
+    except ValueError:
+        return False
+
+try:
+    old = pathlib.Path(sys.argv[1])
+    settings = plistlib.loads(old.read_bytes()).get('EnvironmentVariables', {}) if old.exists() else {}
+    def get(key, default=''):
+        return os.environ.get(key) or settings.get(key) or settings.get('PHONE_REMOTE_' + key.removeprefix('IPHONE_USE_')) or default
+    host = get('IPHONE_USE_HOST', '127.0.0.1').strip()
+    public = get('IPHONE_USE_PUBLIC_URL')
+    relay = get('IPHONE_USE_RELAY_URL')
+    remote = get('IPHONE_USE_REMOTE_ACCESS') == '1'
+    proxies = [p.strip() for p in get('IPHONE_USE_TRUSTED_PROXY_IPS').split(',') if p.strip()]
+    state = pathlib.Path(get('IPHONE_USE_STATE_DIR', str(pathlib.Path(sys.argv[2]) / '.iphone-use')))
+    if sys.argv[3] != 'default' and not get('IPHONE_USE_STATE_DIR'):
+        state = state / 'instances' / sys.argv[3]
+    profile = state / 'remote.json'
+    if profile.exists() or profile.is_symlink():
+        metadata = profile.lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077 or metadata.st_size > 16384 or metadata.st_nlink != 1):
+            fail()
+        saved = json.loads(profile.read_bytes())
+        if saved.get('version') != 1 or type(saved.get('enabled')) is not bool:
+            fail()
+        remote, host = saved['enabled'], '127.0.0.1'
+        public, relay, proxies = saved.get('public_url') or '', saved.get('relay_url') or '', saved.get('trusted_proxy_ips', [])
+        if not remote and (public or relay or proxies):
+            fail()
+    if public and not secure_url(public): fail()
+    if relay and not secure_url(relay, True): fail()
+    if any(not ipaddress.ip_address(p).is_loopback for p in proxies): fail()
+    if not loopback(host) or public or relay:
+        password, token = get('IPHONE_USE_PASSWORD'), get('IPHONE_USE_AGENT_TOKEN')
+        if not (remote and (public or relay) and password.strip() and token.strip() and password != token):
+            fail()
+except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    fail()
+PY_POLICY
 }
 
 echo ""
@@ -2389,12 +2331,17 @@ if ! launchctl print "gui/$UID_NUM" >/dev/null 2>&1; then
     warn "Running over SSH is fine ONLY if the desktop user is also logged in."
 fi
 
-# `curl | sh` runs only this small bootstrap. It resolves one release tag to an
-# exact commit for every raw executable helper, downloads the app from that
-# release tag, verifies the app asset's published SHA-256, then invokes the
-# downloaded installer as a real local file. It never inspects sibling files in
-# the caller's current working directory.
+# Piped network installation is refused. Only an explicitly reviewed local
+# checkout or the private snapshot produced by the signed-bundle verifier may
+# supply the app, helper scripts and release-matched skill.
 INSTANCE_FORWARD_ARGS=()
+NETWORK_PLIST="$PLIST_DST"
+if [ "$INSTANCE_NAME" != default ]; then
+    NETWORK_PLIST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.${INSTANCE_NAME}.plist"
+elif [ ! -f "$NETWORK_PLIST" ] && [ -f "$OLD_PLIST" ]; then
+    NETWORK_PLIST="$OLD_PLIST"
+fi
+preflight_remote_migration "$NETWORK_PLIST"
 if [ "$INSTANCE_NAME" != default ]; then
     INSTANCE_FORWARD_ARGS=(--instance "$INSTANCE_NAME")
     [ -z "$INSTANCE_UDID" ] || INSTANCE_FORWARD_ARGS+=(--udid "$INSTANCE_UDID")
@@ -2481,54 +2428,33 @@ plist_own_env_keys() {
     done
 }
 
-# The daily auto-update job (scripts/auto-update.sh): on by default, so installs
-# that predate a fix still get it. Off when the user said so, persistently
-# (`auto-update.sh disable`, --no-auto-update, IPHONE_USE_AUTO_UPDATE=0), and
-# left alone in CI or with the update check turned off. Never fails the install.
+# Never opt a user into unattended execution of downloaded code. Version
+# notices are supplied by the daemon; the old scheduled installer is retired.
+# This intentionally does not download/source an updater in order to disable it.
 setup_auto_update() {
-    local src="" dl="" marker="$HOME/.iphone-use/auto-update.disabled"
-    # Running under the job: reloading it would kill this very upgrade, and the
-    # job refreshes its own script once the upgrade lands.
-    if [ "${IPHONE_USE_AUTO_UPDATE_JOB:-}" = 1 ] || [ "${IPHONE_USE_AUTO_UPDATE:-}" = 1 ]; then
+    local state="$HOME/.iphone-use" label="com.leeguoo.iphone-use.autoupdate"
+    local job="$HOME/Library/LaunchAgents/com.leeguoo.iphone-use.autoupdate.plist"
+    [ ! -L "$state" ] && [ ! -L "$state/auto-update.disabled" ] \
+        || { warn "Refusing a symlinked automatic-update opt-out path."; return 1; }
+    (umask 077; mkdir -p "$state" && : > "$state/auto-update.disabled") \
+        || { warn "Could not persist automatic-update opt-out."; return 1; }
+    chmod 600 "$state/auto-update.disabled" || return 1
+    [ -z "${CI:-}" ] || return 0
+    launchctl disable "gui/$(id -u)/$label" \
+        || { warn "Could not disable the old automatic-update job."; return 1; }
+    # Do not kill an older updater while it is installing this very release.
+    # Disable future launches immediately; let the active transaction finish.
+    if [ "${IPHONE_USE_AUTO_UPDATE_JOB:-}" = 1 ]; then
+        warn "Automatic upgrades disabled; the already running installer may finish."
         return 0
     fi
-    if [ -n "${CI:-}" ] || [ -n "${IPHONE_USE_NO_UPDATE_CHECK:-}" ] || [ -n "${USE_NO_UPDATE_CHECK:-}" ]; then
-        info "Automatic upgrades: left as they are (CI or the update check is off)."
-        return 0
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        warn "The automatic-update job did not stop; keeping its plist for recovery."
+        return 1
     fi
-    if [ "$SCRIPT_IS_LOCAL" = "1" ] && [ -f "$SCRIPT_DIR/scripts/auto-update.sh" ]; then
-        src="$SCRIPT_DIR/scripts/auto-update.sh"
-    elif [ -n "${RELEASE_COMMIT:-}" ]; then
-        dl="$(mktemp)"
-        if curl -fsSL "https://raw.githubusercontent.com/$REPO/$RELEASE_COMMIT/scripts/auto-update.sh" -o "$dl" \
-            && /bin/bash -n "$dl"; then
-            src="$dl"
-        fi
-    fi
-    if [ -z "$src" ]; then
-        warn "Automatic upgrades: this release ships no auto-update.sh; left as they are."
-        [ -z "$dl" ] || rm -f "$dl"
-        return 0
-    fi
-    case "${IPHONE_USE_AUTO_UPDATE:-}" in
-        0|false|no|off)
-            if env -u IPHONE_USE_STATE_DIR /bin/bash "$src" disable >/dev/null 2>&1; then
-                info "Automatic upgrades: off (turn on with: ~/.iphone-use/auto-update.sh enable)."
-            else
-                warn "Automatic upgrades: could not turn them off; run: $src disable"
-            fi
-            ;;
-        *)
-            if [ -f "$marker" ]; then
-                info "Automatic upgrades: off ($marker; turn on with: ~/.iphone-use/auto-update.sh enable)."
-            elif env -u IPHONE_USE_STATE_DIR /bin/bash "$src" enable >/dev/null 2>&1; then
-                ok "Automatic upgrades: on, daily at 04:30 when the phone is idle (off: ~/.iphone-use/auto-update.sh disable)."
-            else
-                warn "Automatic upgrades could not be turned on; see $LOG_DIR/auto-update.log."
-            fi
-            ;;
-    esac
-    [ -z "$dl" ] || rm -f "$dl"
+    rm -f "$job" || return 1
+    info "Automatic upgrades: off. Version checks remain notification-only."
     return 0
 }
 
@@ -2547,6 +2473,9 @@ install_named_instance() {
     [ -f "$setup_src" ] && [ -f "$uninstall_src" ] \
         || die "setup-runner.sh/uninstall.sh are missing next to this installer."
     [ "$#" -le 1 ] || die "Only one app path may be given."
+
+    [ "${IPHONE_USE_AUTO_UPDATE_JOB:-0}" != 1 ] || die "Unattended instance installation is disabled."
+    setup_auto_update || die "Cannot confirm the shared updater has stopped."
 
     # Resolve and check the instance before touching anything: an invalid
     # name, a port another instance owns, or a phone another daemon drives
@@ -2649,7 +2578,7 @@ install_named_instance() {
     add_env MJPEG_PORT "$mjpeg_port"
     add_env RUST_LOG "$(pick RUST_LOG)"
     [ -n "$(pick RUST_LOG)" ] || add_env RUST_LOG warn
-    for key in IPHONE_USE_IDLE_RELEASE_SECS IPHONE_USE_IDLE_RELEASE IPHONE_USE_PASSWORD IPHONE_USE_NO_UPDATE_CHECK IPHONE_USE_BASE_PATH; do
+    for key in IPHONE_USE_IDLE_RELEASE_SECS IPHONE_USE_IDLE_RELEASE IPHONE_USE_PASSWORD IPHONE_USE_NO_UPDATE_CHECK IPHONE_USE_BASE_PATH IPHONE_USE_REMOTE_ACCESS IPHONE_USE_RELAY_URL IPHONE_USE_PUBLIC_URL IPHONE_USE_TRUSTED_PROXY_IPS; do
         add_env "$key" "$(pick "$key")"
     done
     for key in IPU_RUNNER_TEAM_ID IPU_RUNNER_BUNDLE_ID IPU_RUNNER_ALLOW_LAN IPU_RUNNER_TRANSPORT IPU_RUNNER_SRC; do
@@ -2997,6 +2926,19 @@ if [ -n "${IPHONE_USE_INTERNAL_TEST_COMMIT_STATE_ONLY:-}" ]; then
     esac
 fi
 
+# A reviewed local tree (or a fully verified private release snapshot) is the
+# only install source. Reject incomplete input BEFORE changing skills/services.
+[ "${IPHONE_USE_AUTO_UPDATE_JOB:-0}" != 1 ] \
+    || die "Unattended installation is disabled; review and confirm a local release."
+[ -n "${1:-}" ] && [ "$SCRIPT_IS_LOCAL" = 1 ] \
+    || die "Supply a reviewed local app; piped/network installation is disabled."
+for REQUIRED_LOCAL in scripts/setup-runner.sh uninstall.sh skills/iphone-use/SKILL.md; do
+    [ -f "$SCRIPT_DIR/$REQUIRED_LOCAL" ] && [ ! -L "$SCRIPT_DIR/$REQUIRED_LOCAL" ] \
+        || die "Incomplete local release: missing $REQUIRED_LOCAL; no network fallback."
+done
+runner_tree_valid "$SCRIPT_DIR/runner" || die "Incomplete local release: invalid runner tree."
+setup_auto_update || die "Cannot confirm that the old automatic updater has stopped."
+
 # Skill and daemon are one transaction. Install and byte-verify the exact
 # companion skill before any app/plist/launchd mutation; cleanup restores it if
 # a later daemon step fails.
@@ -3184,10 +3126,11 @@ append_plist_env() {
 "
 }
 
-# The iPhone reaches the web UI over the LAN, so bind 0.0.0.0 by default.
+# New installations are local-only. Existing host settings are never silently
+# rewritten; incompatible remote installs were refused by the preflight above.
 # A password remains mandatory here — generated only when neither the current
 # environment nor the previous install supplies one.
-HOST="$(env_or_existing IPHONE_USE_HOST 0.0.0.0)"
+HOST="$(env_or_existing IPHONE_USE_HOST 127.0.0.1)"
 PORT="$(env_or_existing IPHONE_USE_PORT 44321)"
 HOST="$(printf '%s' "$HOST" \
     | LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -3220,15 +3163,23 @@ if [ -z "$PASSWORD" ]; then
     PW_SOURCE="existing"
 fi
 if [ -z "$PASSWORD" ]; then
-    PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16 || true)"
-    [ -n "$PASSWORD" ] || PASSWORD="$(date +%s | shasum | head -c 16)"
+    PASSWORD="$(/usr/bin/openssl rand -hex 24)" || die "Secure password generation failed; refusing a weak fallback."
+    [ "${#PASSWORD}" -eq 48 ] || die "Secure password generation returned an invalid value."
     PW_SOURCE="generated"
 fi
 case "$PW_SOURCE" in
     env)      ok "Using password from \$IPHONE_USE_PASSWORD" ;;
     existing) ok "Reusing the password from the existing install" ;;
-    generated) ok "Generated a random access password (shown at the end)" ;;
+    generated) ok "Generated a random access password (stored only in the private LaunchAgent plist)" ;;
 esac
+
+# Give new installations a separate machine credential. Existing local installs
+# retain their saved clients until the operator explicitly migrates credentials.
+AGENT_TOKEN="$(env_or_existing IPHONE_USE_AGENT_TOKEN)"
+if [ -z "$AGENT_TOKEN" ] && [ ! -f "$PLIST_DST" ] && [ ! -f "$OLD_PLIST" ]; then
+    AGENT_TOKEN="$(/usr/bin/openssl rand -hex 32)" || die "Secure agent token generation failed."
+    [ "${#AGENT_TOKEN}" -eq 64 ] || die "Invalid generated agent token."
+fi
 
 # Best-effort LAN IP for the final connect instructions.
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
@@ -3346,14 +3297,7 @@ SETUP_RUNNER_SRC=""
 if [ "$SCRIPT_IS_LOCAL" = "1" ] && [ -f "$SCRIPT_DIR/scripts/setup-runner.sh" ]; then
     SETUP_RUNNER_SRC="$SCRIPT_DIR/scripts/setup-runner.sh"
 else
-    ensure_release_commit
-    SETUP_RUNNER_DL="$(mktemp)"
-    curl -fsSL "https://raw.githubusercontent.com/$REPO/$RELEASE_COMMIT/scripts/setup-runner.sh" \
-        -o "$SETUP_RUNNER_DL" \
-        || die "Could not fetch setup-runner.sh from release $RELEASE_REF commit $RELEASE_COMMIT."
-    [ -s "$SETUP_RUNNER_DL" ] \
-        || die "Release $RELEASE_REF contains an empty setup-runner.sh."
-    SETUP_RUNNER_SRC="$SETUP_RUNNER_DL"
+    die "Local release is missing setup-runner.sh; network fallback is disabled."
 fi
 
 # Stage and syntax-check before touching the fixed hand-off path. Keep a backup
@@ -3381,14 +3325,7 @@ UNINSTALL_SRC=""
 if [ "$SCRIPT_IS_LOCAL" = "1" ] && [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
     UNINSTALL_SRC="$SCRIPT_DIR/uninstall.sh"
 else
-    ensure_release_commit
-    UNINSTALL_DL="$(mktemp)"
-    curl -fsSL "https://raw.githubusercontent.com/$REPO/$RELEASE_COMMIT/uninstall.sh" \
-        -o "$UNINSTALL_DL" \
-        || die "Could not fetch uninstall.sh from release $RELEASE_REF commit $RELEASE_COMMIT."
-    [ -s "$UNINSTALL_DL" ] \
-        || die "Release $RELEASE_REF contains an empty uninstall.sh."
-    UNINSTALL_SRC="$UNINSTALL_DL"
+    die "Local release is missing uninstall.sh; network fallback is disabled."
 fi
 UNINSTALL_STAGE="$(mktemp "$HOME/.iphone-use/uninstall.sh.new.XXXXXX")"
 cp -f "$UNINSTALL_SRC" "$UNINSTALL_STAGE"
@@ -3423,12 +3360,16 @@ append_plist_env RUST_LOG "$(env_or_existing RUST_LOG info)"
 append_plist_env IPHONE_USE_HOST "$HOST"
 append_plist_env IPHONE_USE_PORT "$PORT"
 append_plist_env IPHONE_USE_PASSWORD "$PASSWORD"
+append_plist_env IPHONE_USE_AGENT_TOKEN "$AGENT_TOKEN"
 append_plist_env IPHONE_USE_UDID "$DEVICE_UDID"
 append_plist_env IPHONE_USE_RUNNER_URL "$IPU_RUNNER_URL"
 append_plist_env IPHONE_USE_RUNNER_MJPEG_URL "$IPU_RUNNER_MJPEG_URL"
 append_plist_env IPHONE_USE_RUNNER_MANAGED "$IPU_RUNNER_MANAGED"
 for ENV_KEY in \
-    IPHONE_USE_AGENT_TOKEN \
+    IPHONE_USE_REMOTE_ACCESS \
+    IPHONE_USE_RELAY_URL \
+    IPHONE_USE_PUBLIC_URL \
+    IPHONE_USE_TRUSTED_PROXY_IPS \
     IPHONE_USE_BASE_PATH \
     IPHONE_USE_NO_UPDATE_CHECK \
     IPHONE_USE_SECRET \
@@ -3747,8 +3688,7 @@ if [ "$IPU_RUNNER_READY" = "1" ] \
     while [ "$DAEMON_STATUS_TRIES" -lt 30 ]; do
         DAEMON_STATUS_TRIES=$((DAEMON_STATUS_TRIES + 1))
         if [ -n "$DAEMON_AGENT_SECRET" ]; then
-            DAEMON_STATUS="$(curl -sS --noproxy '*' -m 2 \
-                -H "Authorization: Bearer $DAEMON_AGENT_SECRET" \
+            DAEMON_STATUS="$(curl_auth_config "$DAEMON_AGENT_SECRET" | curl -sS --noproxy '*' -m 2 -K - \
                 "${DAEMON_PROBE_URL%/}/agent/status" 2>/dev/null || true)"
         else
             DAEMON_STATUS="$(curl -sS --noproxy '*' -m 2 \

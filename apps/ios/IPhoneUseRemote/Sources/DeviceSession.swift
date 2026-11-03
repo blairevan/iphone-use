@@ -294,6 +294,31 @@ final class DeviceSession: ObservableObject, Identifiable {
         return true
     }
 
+    /// Before moving stored credentials, require verified TLS and the old
+    /// pairing's proof, then authenticate and read status at the new endpoint.
+    /// Any failure leaves the old route and Keychain accounts untouched.
+    func prepareMigration(to base: URL) async throws -> (client: DaemonClient, status: PhoneStatus) {
+        guard !PairingRevocation.requiresAuthorization(address: address, freshCredential: false) else {
+            throw DaemonError.pairingRevoked
+        }
+        guard let key = Self.savedLANKey(address) ?? client?.lanKey else {
+            throw DaemonError.unreachable("这条旧连接没有设备身份证明，请在新的 HTTPS 地址重新扫码配对；原连接未改动。")
+        }
+        let candidate = DaemonClient(base: base, lanKey: key)
+        guard await candidate.provesIdentity(at: base, key: key) else {
+            throw DaemonError.unreachable("新地址未通过 HTTPS 和设备身份验证，未发送保存的凭据，原连接未改动。")
+        }
+        if let token = deviceToken {
+            try await candidate.renew(deviceToken: token)
+        } else if let password = Keychain.password(for: address) {
+            try await candidate.login(password: password)
+        } else {
+            throw DaemonError.unreachable("没有可迁移的凭据，请在 HTTPS 地址重新配对。")
+        }
+        let status = try await candidate.status()
+        return (candidate, status)
+    }
+
     static func savePassword(_ password: String, for address: String) {
         Keychain.save(password: password, for: address)
     }
@@ -323,6 +348,10 @@ final class DeviceSession: ObservableObject, Identifiable {
         let token = typed == nil ? deviceToken : nil
         let password = typed ?? Keychain.password(for: address)
         let code = typed == nil && token == nil ? pendingPair.flatMap { $0.fresh ? $0.code : nil } : nil
+        if PairingRevocation.requiresAuthorization(address: address, freshCredential: typed != nil || code != nil) {
+            fail(.pairingRevoked)
+            return
+        }
         guard token != nil || code != nil || password?.isEmpty == false else {
             pendingPair = nil
             phase = .failed(.noCredentials)
@@ -346,13 +375,8 @@ final class DeviceSession: ObservableObject, Identifiable {
                 Keychain.save(password: password, for: address)
             }
             guard mine == generation else { return }
+            if typed != nil || code != nil { PairingRevocation.authorized(address: address) }
             try await adopt(client, generation: mine)
-        } catch DaemonError.pairingRevoked where Keychain.password(for: address) != nil {
-            guard mine == generation else { return }
-            // The pairing died (password changed?); fall back to the password.
-            Keychain.delete(for: Self.deviceAccount(address))
-            phase = .idle
-            await connect(password: nil)
         } catch {
             guard mine == generation else { return }
             fail(ConnectProblem(error))
@@ -362,7 +386,11 @@ final class DeviceSession: ObservableObject, Identifiable {
     /// Record a failed attempt and decide what happens next.
     func fail(_ problem: ConnectProblem) {
         switch problem {
-        case .pairingRevoked: Keychain.delete(for: Self.deviceAccount(address))
+        case .pairingRevoked:
+            PairingRevocation.mark(address: address)
+            Keychain.delete(for: Self.deviceAccount(address))
+            Keychain.delete(for: address)
+            pendingPair = nil
         case .pairCodeExpired: pendingPair = nil
         default: break
         }
@@ -412,11 +440,12 @@ final class DeviceSession: ObservableObject, Identifiable {
     /// Commit a client that has a session (a login, a renewal or a fresh
     /// pairing). An existing connection is dropped only once the new one has
     /// answered a status read.
-    func adopt(_ client: DaemonClient, generation expected: Int? = nil) async throws {
+    func adopt(_ client: DaemonClient, generation expected: Int? = nil, verifiedStatus: PhoneStatus? = nil) async throws {
         // Authentication may already have selected a verified LAN route.
         // A dead public URL must not fail status before a LAN probe finishes.
-        if !client.onLAN, let lan = await client.probeLAN() { client.use(lan) }
-        let status = try await client.status()
+        if verifiedStatus == nil, !client.onLAN, let lan = await client.probeLAN() { client.use(lan) }
+        let status: PhoneStatus
+        if let verifiedStatus { status = verifiedStatus } else { status = try await client.status() }
         if let expected, expected != generation { return }
         generation += 1
         if self.client != nil { teardown() }
@@ -851,14 +880,8 @@ final class DeviceSession: ObservableObject, Identifiable {
             }
             do {
                 if let token {
-                    do {
-                        if let fresh = try await client.renew(deviceToken: token) {
-                            Keychain.save(password: fresh, for: Self.deviceAccount(self.address))
-                        }
-                    } catch DaemonError.pairingRevoked where password != nil {
-                        // The pairing died (password changed?); the saved password may still work.
-                        Keychain.delete(for: Self.deviceAccount(self.address))
-                        try await client.login(password: password!)
+                    if let fresh = try await client.renew(deviceToken: token) {
+                        Keychain.save(password: fresh, for: Self.deviceAccount(self.address))
                     }
                 } else if let password {
                     try await client.login(password: password)

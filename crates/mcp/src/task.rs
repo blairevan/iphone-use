@@ -134,6 +134,9 @@ pub enum ConfirmPolicy {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TaskRequest {
+    /// Set by the daemon after authentication, never accepted from JSON.
+    #[serde(skip)]
+    pub principal: String,
     pub goal: String,
     #[serde(default)]
     pub client_request_id: Option<String>,
@@ -191,6 +194,8 @@ impl Status {
 #[derive(Debug, Clone)]
 struct State {
     id: String,
+    principal: String,
+    confirmation_seq: u64,
     goal: String,
     client_request_id: Option<String>,
     request_fingerprint: String,
@@ -374,6 +379,8 @@ pub fn start(
     let task = Arc::new(Task {
         state: Mutex::new(State {
             id: id.clone(),
+            principal: request.principal.clone(),
+            confirmation_seq: 0,
             goal: goal.clone(),
             client_request_id: request.client_request_id.clone(),
             request_fingerprint: request_fingerprint.clone(),
@@ -397,7 +404,7 @@ pub fn start(
     });
     let busy = registry(|r| {
         if let Some(client_id) = &request.client_request_id {
-            if let Some(existing) = r.current.iter().chain(r.recent.iter()).find(|task| task.with(|s|s.client_request_id.as_ref()==Some(client_id))) {
+            if let Some(existing) = r.current.iter().chain(r.recent.iter()).find(|task| task.with(|s|s.principal == request.principal && s.client_request_id.as_ref()==Some(client_id))) {
                 return Some((existing.with(|s|s.id.clone()), true, existing.with(|s|s.request_fingerprint==request_fingerprint)));
             }
         }
@@ -448,6 +455,134 @@ pub fn get(id: &str, since: Option<usize>) -> Option<Value> {
         find(id)
     }?;
     Some(task.with(|s| s.to_json(since, true)))
+}
+
+/// Resolve a task within an authenticated principal's namespace. The synthetic
+/// `current` alias must not expose somebody else's task or goal.
+pub fn get_for(id: &str, since: Option<usize>, principal: &str) -> Option<Value> {
+    if principal.is_empty() {
+        return None;
+    }
+    let task = if id == "current" {
+        registry(|r| {
+            r.current
+                .iter()
+                .chain(r.recent.iter())
+                .find(|task| task.with(|s| s.principal == principal))
+                .cloned()
+        })
+    } else {
+        find(id)
+    }?;
+    task.with(|s| (s.principal == principal).then(|| s.to_json(since, true)))
+}
+
+/// Serialize only this authenticated caller's task history.
+pub fn list_for(principal: &str) -> Value {
+    let tasks: Vec<Value> = registry(|r| {
+        r.current
+            .iter()
+            .chain(r.recent.iter())
+            .filter_map(|task| {
+                task.with(|s| {
+                    (!principal.is_empty() && s.principal == principal)
+                        .then(|| s.to_json(None, false))
+                })
+            })
+            .collect()
+    });
+    json!({"ok":true,"tasks":tasks})
+}
+
+/// Credential revocation cancels only tasks actually owned by that verified
+/// principal; a display owner cannot select another caller's task.
+pub fn cancel_principal(principal: &str) {
+    let tasks: Vec<_> = registry(|r| {
+        r.current
+            .iter()
+            .chain(r.recent.iter())
+            .filter(|task| task.with(|s| s.principal == principal && !s.status.finished()))
+            .cloned()
+            .collect()
+    });
+    for task in tasks {
+        task.cancel.store(true, Ordering::SeqCst);
+        task.cancel_signal.notify_one();
+        if let Some(sender) = task.answer.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = sender.send(false);
+        }
+    }
+}
+
+/// The HTTP mutation boundary. Authorization and prompt-version validation
+/// happen under the same state lock, so takeover cannot race an old approval.
+pub fn act_for(
+    id: &str,
+    principal: &str,
+    verb: &str,
+    approve: Option<bool>,
+    confirmation_id: Option<&str>,
+) -> std::result::Result<(), &'static str> {
+    let task = find(id).ok_or("not_found")?;
+    task.with(|s| {
+        if principal.is_empty() || s.principal != principal {
+            return Err("not_found");
+        }
+        if s.status.finished() {
+            return Err("finished");
+        }
+        match verb {
+            "confirm" => {
+                let expected = s
+                    .confirm
+                    .as_ref()
+                    .and_then(|v| v["confirmation_id"].as_str());
+                if s.status != Status::NeedsConfirm
+                    || expected.is_none()
+                    || expected != confirmation_id
+                {
+                    return Err("stale_confirmation");
+                }
+                let approve = approve.ok_or("invalid_request")?;
+                let sender = task
+                    .answer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .ok_or("not_waiting")?;
+                sender.send(approve).map_err(|_| "not_waiting")
+            }
+            "cancel" => {
+                task.cancel.store(true, Ordering::SeqCst);
+                task.cancel_signal.notify_one();
+                if let Some(sender) = task.answer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = sender.send(false);
+                }
+                Ok(())
+            }
+            "pause" | "resume" => {
+                if verb == "pause" && (s.phase == "flow" || s.status == Status::NeedsConfirm) {
+                    return Err("pause_not_available_for_this_step");
+                }
+                task.paused.store(verb == "pause", Ordering::SeqCst);
+                Ok(())
+            }
+            _ => Err("not_found"),
+        }
+    })
+}
+
+/// Explicit administrative transfer, called ONLY after fresh administrator
+/// authentication by the daemon. It cannot approve a pending action itself.
+pub fn take_over(id: &str, principal: &str) -> std::result::Result<(), &'static str> {
+    if principal.is_empty() {
+        return Err("not_found");
+    }
+    let task = find(id).ok_or("not_found")?;
+    task.with(|s| {
+        s.principal = principal.to_owned();
+    });
+    Ok(())
 }
 
 /// Answer a `needs_confirm`. Err when the task is not waiting.
@@ -1309,7 +1444,12 @@ pub fn parse_assist(answer: &str, targets: usize) -> Result<AssistDecision> {
 enum FlowAttempt { Done, Continue, Declined }
 
 /// A declined flow ends the task; a failed flow may continue step by step.
-async fn try_flow(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request: &TaskRequest) -> Result<Option<FlowAttempt>> {
+async fn try_flow(
+    task: &Arc<Task>,
+    daemon: &DaemonClient,
+    chat: &Chat,
+    request: &TaskRequest,
+) -> Result<Option<FlowAttempt>> {
     let filter = crate::registry::ListFilter { category: None, app: None, verified_only: false };
     let Ok((entries, _)) = crate::registry::list(&filter) else {
         return Ok(None);
@@ -1349,13 +1489,21 @@ async fn try_flow(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request:
         .filter(|(name, _)| chosen.meta.inputs.contains(name))
         .map(|(k, v)| format!("{k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
         .collect();
-    let side_effect = matches!(chosen.meta.risk, Some(crate::flow::FlowRisk::SideEffect));
-    if side_effect && request.confirm == ConfirmPolicy::Risky {
+    // Pin the actual bytes and inputs BEFORE asking. A registry refresh during
+    // the prompt must never substitute a different implementation afterward.
+    let path = crate::registry::resolve_target(id)?;
+    let prepared = crate::flow::load_flow(&path)?;
+    let resolved_inputs = crate::flow::parse_input_assignments(&inputs, &prepared.inputs)?;
+    crate::flow::materialized_request(&prepared, &resolved_inputs)?;
+    let requires_review = !crate::flow_policy::is_approved(&prepared, &resolved_inputs)?;
+    if requires_review {
         let approved = ask_person(
             task,
             daemon,
             request,
-            json!({"action": "RUN_FLOW", "target": chosen.meta.name, "reason": "this saved flow sends, pays or deletes something", "app": chosen.meta.app}),
+            json!({"action": "RUN_FLOW", "target": prepared.meta.name,
+                "reason": format!("Unreviewed flow (risk={}); review target and inputs before allowing it. Inputs: {}. SHA-256: {}", prepared.meta.risk_label(), serde_json::to_string(&resolved_inputs)?, prepared.content_sha256),
+                "app": prepared.meta.app, "flow_sha256": prepared.content_sha256}),
         )
         .await;
         if !approved {
@@ -1364,7 +1512,12 @@ async fn try_flow(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request:
     }
     let started = Instant::now();
     task.with(|s| s.flow = Some(json!({"id": id, "name": chosen.meta.name, "outcome": "running"})));
-    let result = crate::flow::run_for_task(daemon, id, &inputs, side_effect).await;
+    // Only this pinned flow is covered. A locale sibling or a changed registry
+    // entry needs its own review rather than inheriting this answer.
+    let result =
+        crate::flow::execute_and_diagnose(&prepared, &resolved_inputs, daemon, requires_review)
+            .await
+            .map(|run| (run.succeeded, run.value));
     let (ok, value) = match result {
         Ok((ok, value)) => (ok, value),
         Err(error) => (false, json!({"error": format!("{error:#}")})),
@@ -1379,10 +1532,17 @@ async fn try_flow(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request:
 
 /// Wait for the person to allow a risky step. On the same phone, bring the
 /// app that started the task to the front so they see the question.
-async fn ask_person(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest, question: Value) -> bool {
+async fn ask_person(
+    task: &Arc<Task>,
+    daemon: &DaemonClient,
+    request: &TaskRequest,
+    mut question: Value,
+) -> bool {
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    *task.answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
     task.with(|s| {
+        s.confirmation_seq = s.confirmation_seq.saturating_add(1);
+        question["confirmation_id"] = json!(format!("{}:{}:{}", s.id, s.confirmation_seq, crate::registry::sha256_hex(question.to_string().as_bytes())));
+        *task.answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
         s.status = Status::NeedsConfirm;
         s.confirm = Some(question);
     });
@@ -1498,25 +1658,87 @@ mod tests {
         use sha2::{Digest, Sha256};
         let request_fingerprint=format!("{:x}",Sha256::digest(format!("{request:?}").as_bytes()));
         let task=Arc::new(Task {
-            state: Mutex::new(State {request_fingerprint,id:"fixture-dedup".into(),goal:"synthetic goal".into(),client_request_id:Some("fixture-client".into()),status:Status::Running,phase:"observing",planned_action:None,flow:None,steps:vec![],confirm:None,summary:None,error:None,started_at_ms:unix_ms(),started:Instant::now(),finished_ms:None,models_used:json!({})}),
+            state: Mutex::new(State {principal:String::new(),confirmation_seq:0,request_fingerprint,id:"fixture-dedup".into(),goal:"synthetic goal".into(),client_request_id:Some("fixture-client".into()),status:Status::Running,phase:"observing",planned_action:None,flow:None,steps:vec![],confirm:None,summary:None,error:None,started_at_ms:unix_ms(),started:Instant::now(),finished_ms:None,models_used:json!({})}),
             cancel:AtomicBool::new(false),paused:AtomicBool::new(false),cancel_signal:tokio::sync::Notify::new(),answer:Mutex::new(None),
         });
         registry(|r| { r.current=Some(task.clone());r.recent.clear(); });
         assert_eq!(start(request.clone(), |_|panic!("duplicate must not instantiate a driver")).ok().as_deref(),Some("fixture-dedup"));
-        let mut different=request.clone();different.goal="different goal".into();
+        let mut different = request.clone();
+        different.goal = "different goal".into();
         assert!(matches!(start(different, |_|panic!("must not drive")),Err(StartError::Invalid(_))));
-        let mut different_app=request.clone();different_app.app=Some("com.example.changed".into());
+        let mut different_app = request.clone();
+        different_app.app = Some("com.example.changed".into());
         assert!(matches!(start(different_app, |_|panic!("must not drive")),Err(StartError::Invalid(_))));
         pause("fixture-dedup",true).unwrap();
         let driver=DaemonClient::new("http://127.0.0.1:1",None);
-        let waiting_task=task.clone();let waiting_request=request.clone();
+        let waiting_task = task.clone();
+        let waiting_request = request.clone();
         let wait=tokio::spawn(async move {waiting_task.wait_unpaused(&driver,&waiting_request).await});
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(get("fixture-dedup",None).unwrap()["status"],"paused");
-        assert!(!Status::Paused.finished());pause("fixture-dedup",false).unwrap();assert!(wait.await.unwrap());
+        assert!(!Status::Paused.finished());
+        pause("fixture-dedup", false).unwrap();
+        assert!(wait.await.unwrap());
         task.with(|s|s.status=Status::Done);
         assert!(pause("fixture-dedup",true).is_err());
         assert_eq!(start(request, |_|panic!("finished duplicate must not drive")).ok().as_deref(),Some("fixture-dedup"));
+        task.with(|s| {
+            s.principal = "fixture-owner".into();
+            s.status = Status::NeedsConfirm;
+            s.confirm = Some(json!({"confirmation_id":"prompt-2","action":"CLICK"}));
+        });
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *task.answer.lock().unwrap() = Some(sender);
+        assert!(get_for("fixture-dedup", None, "stranger").is_none());
+        assert!(get_for("current", None, "stranger").is_none());
+        assert!(list_for("stranger")["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(
+            act_for("fixture-dedup", "stranger", "cancel", None, None),
+            Err("not_found")
+        );
+        assert_eq!(
+            act_for(
+                "fixture-dedup",
+                "fixture-owner",
+                "confirm",
+                Some(true),
+                Some("prompt-1")
+            ),
+            Err("stale_confirmation")
+        );
+        assert!(
+            task.answer.lock().unwrap().is_some(),
+            "stale answers cannot consume the new prompt"
+        );
+        take_over("fixture-dedup", "fixture-admin").unwrap();
+        assert!(get_for("fixture-dedup", None, "fixture-owner").is_none());
+        assert_eq!(
+            act_for(
+                "fixture-dedup",
+                "fixture-owner",
+                "confirm",
+                Some(true),
+                Some("prompt-2")
+            ),
+            Err("not_found")
+        );
+        act_for(
+            "fixture-dedup",
+            "fixture-admin",
+            "confirm",
+            Some(true),
+            Some("prompt-2"),
+        )
+        .unwrap();
+        assert!(receiver.await.unwrap());
+        let forged: TaskRequest = serde_json::from_value(
+            json!({"goal":"fixture", "principal":"forged-admin", "owner":"forged-admin"}),
+        )
+        .unwrap();
+        assert!(
+            forged.principal.is_empty(),
+            "JSON cannot manufacture an authenticated identity"
+        );
         registry(|r|r.current=None);
     }
 

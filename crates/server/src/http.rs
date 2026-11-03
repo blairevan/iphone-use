@@ -60,19 +60,11 @@ const SESSION_COOKIE: &str = "phone_session";
 // Rate limiter (login + agent bearer auth failures)
 // ---------------------------------------------------------------------------
 
-/// In-memory failure tracking for `/login` (wrong password) and failed agent
-/// bearer auth.  After [`AUTH_MAX_FAILURES`] consecutive failures the limiter
-/// locks out all auth attempts for [`AUTH_LOCKOUT_SECS`] seconds.
-///
-/// **Design notes / tradeoffs:**
-/// - Global (not per-IP) to keep the implementation simple and testable.
-///   This daemon fronts a single household: the realistic threat is a brute-
-///   force bot, not a multi-origin attack, and per-IP requires `ConnectInfo`
-///   which is unavailable in axum oneshot tests.
-/// - A success (correct password) resets the failure counter and lifts an
-///   active lockout immediately — legitimate users are never permanently
-///   locked out by their own typos.
-/// - The lockout window is 30 seconds (sliding, reset by a success).
+/// Bounded failure tracking for one authentication domain. Login, pairing and
+/// agent credentials have separate instances. Valid credentials are checked
+/// before failure throttling, so anonymous errors cannot revoke a valid session.
+/// This is failure-response throttling, not a substitute for ingress resource
+/// limits or strong credentials; never trust a client-supplied IP or owner here.
 pub struct AuthLimiter {
     pub(crate) failures: u32,
     pub(crate) locked_until: Option<Instant>,
@@ -103,7 +95,14 @@ impl AuthLimiter {
     /// Record an auth failure.  Starts or extends the lockout window once
     /// the failure count reaches [`AUTH_MAX_FAILURES`].
     pub fn record_failure(&mut self) {
-        self.failures += 1;
+        if self
+            .locked_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.failures = 0;
+            self.locked_until = None;
+        }
+        self.failures = self.failures.saturating_add(1);
         if self.failures >= AUTH_MAX_FAILURES {
             self.locked_until =
                 Some(Instant::now() + std::time::Duration::from_secs(AUTH_LOCKOUT_SECS));
@@ -327,7 +326,10 @@ impl Default for RunnerLifecycle {
 
 /// Shared application state for all handlers.
 pub struct AppState {
-    /// Optional shared password; `None` = open (LAN dev) mode.
+    /// Persistent device/session/agent revocation and issued agent scopes.
+    pub credentials: Mutex<crate::credentials::Store>,
+    /// Human login password. Only when both this and agent_token are absent
+    /// is the loopback development server open.
     pub password: Option<String>,
     /// Secret for signing session cookies (always present; generated if unset).
     pub secret: Vec<u8>,
@@ -338,9 +340,23 @@ pub struct AppState {
     /// Path prefix the daemon is also served under (`IPHONE_USE_BASE_PATH`):
     /// `""` or e.g. `"/ix"`. Pages, redirects and the session cookie use it.
     pub base_path: String,
+    /// Trusted HTTPS address selected by the operator, not by request headers.
+    pub public_url: Option<String>,
+    /// Allowed Host values; production always initializes this list.
+    pub allowed_hosts: Vec<String>,
+    /// Transport peers allowed to provide a rewritten, single X-Real-IP.
+    pub trusted_proxy_ips: Vec<std::net::IpAddr>,
+    /// Source admission before password verification, not a session lockout.
+    pub login_admission: Mutex<crate::browser_boundary::LoginAdmission>,
+    /// Administrator password admission is independent of anonymous login.
+    pub admin_admission: Mutex<crate::browser_boundary::LoginAdmission>,
     /// Rate limiter for login and agent bearer auth failures.
     /// After 5 consecutive failures requests are rejected with 429 for 30 s.
     pub auth_limiter: Arc<Mutex<AuthLimiter>>,
+    /// Human password failures, isolated from anonymous pairing/agent requests.
+    pub login_limiter: Arc<Mutex<AuthLimiter>>,
+    /// Pairing failures. Valid renewal tokens bypass this failure-only bucket.
+    pub pair_limiter: Arc<Mutex<AuthLimiter>>,
     /// Optional dedicated bearer token for agent/API access.
     ///
     /// When `Some`, the `Authorization: Bearer` credential on the agent paths must
@@ -998,6 +1014,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(root))
         .route("/phone", get(phone))
         .route("/setup", get(setup))
+        .route("/security", get(crate::security_http::page))
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", get(logout))
         .route("/pair", get(pair_page).post(pair_submit))
@@ -1014,6 +1031,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route("/", to_base())
             .route("/phone", to_base())
             .route("/setup", to_base())
+            .route("/security", to_base())
             .route("/login", to_base())
             .route("/logout", to_base())
             .route("/pair", to_base())
@@ -1021,7 +1039,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             .merge(api.clone())
             .nest(&base, pages.merge(api))
     };
-    app.with_state(state)
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::browser_boundary::layer,
+    ))
+    .with_state(state)
 }
 
 /// An unprefixed page request on a daemon with a base path: send it to the
@@ -1069,6 +1091,8 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/agent/task/:id", get(agent_task_get))
         .route("/agent/task/:id/:verb", post(agent_task_act))
         .route("/agent/tasks", get(agent_tasks))
+        .route("/agent/security/credentials", post(crate::security_http::manage))
+        .route("/agent/security/session", get(crate::security_http::session))
         .route("/agent/reference", get(agent_reference))
         // Shortcuts RPC return path: the phone POSTs structured results here.
         // Safe GET only peeks; destructive consumption has an explicit,
@@ -1162,34 +1186,64 @@ fn session_cookies(headers: &HeaderMap) -> Vec<String> {
 /// request is treated as authed. Otherwise a `phone_session` cookie must carry
 /// a valid, unexpired token signed by the daemon secret.
 pub fn is_authed(state: &AppState, headers: &HeaderMap) -> bool {
-    if state.password.is_none() {
+    if state.password.is_none() && state.agent_token.is_none() {
         return true;
     }
-    session_cookies(headers)
-        .iter()
-        .any(|token| core::auth::check_token(&state.secret, token, now_secs()))
+    session_record(state, headers).is_some()
 }
 
-/// True when the request reached us over HTTPS. The daemon itself always serves
-/// plain HTTP; HTTPS is terminated by the Cloudflare tunnel, which forwards
-/// `X-Forwarded-Proto: https`. We must decide `Secure` **per request** and NOT
-/// from the bind host: a LAN bind (`0.0.0.0`) is still plain HTTP, and a `Secure`
-/// cookie is rejected by browsers over plain HTTP, which silently logs every
-/// LAN viewer out.
+/// Verify a signed session and apply the paired device's shared revocation
+/// identity. Cookie renewal never sidesteps the device's revoked record.
+fn session_record(state: &AppState, headers: &HeaderMap) -> Option<crate::credentials::Record> {
+    session_cookies(headers).iter().find_map(|token| {
+        let subject = core::auth::verified_subject(&state.secret, token, now_secs())?;
+        let (kind, subject) = match subject.strip_prefix("device-") {
+            Some(device) => ("device", device),
+            None => ("session", subject.as_str()),
+        };
+        recover(state.credentials.lock()).authorize(&state.secret, kind, subject, now_secs())
+    })
+}
+
+/// One authentication result for authorization, permissions and task ownership.
+pub(crate) fn authenticated_record(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<crate::credentials::Record> {
+    bearer_record(state, headers).or_else(|| session_record(state, headers))
+}
+
+/// HTTPS is an operator-configured origin, never a decision a supplied
+/// X-Forwarded-Proto can make. Proxies preserve the external Host. Local HTTP
+/// continues to receive its own usable, non-Secure cookie.
 fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
     if state.cookie_secure {
         return true; // explicit force (e.g. an external HTTPS terminator)
     }
     headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.eq_ignore_ascii_case("https"))
-        .unwrap_or(false)
+        .get("x-iphone-use-verified-https")
+        .is_some_and(|v| v == "1")
 }
 
 /// Build the `Set-Cookie` header value for a freshly-minted session.
-fn make_session_cookie(state: &AppState, secure: bool) -> String {
-    let token = core::auth::make_token(&state.secret, state.session_ttl_secs, now_secs());
+fn make_session_cookie(state: &AppState, secure: bool) -> anyhow::Result<String> {
+    let token = core::auth::try_make_token(&state.secret, state.session_ttl_secs, now_secs())
+        .map_err(|_| anyhow::anyhow!("secure entropy unavailable"))?;
+    let subject = core::auth::verified_subject(&state.secret, &token, now_secs())
+        .ok_or_else(|| anyhow::anyhow!("session generation failed"))?;
+    recover(state.credentials.lock()).register(
+        &state.secret,
+        "session",
+        &subject,
+        "Browser session",
+        crate::credentials::Scope::Control,
+        now_secs(),
+    )?;
+    Ok(session_cookie_for_token(state, secure, &token))
+}
+
+/// Serialize a previously signed token; no unverified request value is accepted.
+fn session_cookie_for_token(state: &AppState, secure: bool, token: &str) -> String {
     let secure = if secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE}={token}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
@@ -1430,7 +1484,8 @@ async fn login_submit(
     let chinese = crate::locale::request_prefers_chinese(&headers);
     let expected = match &state.password {
         // Open mode: any login succeeds (no password configured); no limiting.
-        None => return redirect_with_cookie(&state, destination, &headers),
+        None if state.agent_token.is_none() => return redirect_with_cookie(&state, destination, &headers),
+        None => return with_security_headers((StatusCode::UNAUTHORIZED, "password login is not configured; pair this device instead").into_response()),
         Some(p) => p.clone(),
     };
     // The form deliberately uses `novalidate` so feedback is consistent across
@@ -1442,9 +1497,14 @@ async fn login_submit(
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         return with_security_headers(resp);
     }
-    // Check the limiter BEFORE verifying the password (prevents timing oracle).
+    // A correct credential must not be locked out by strangers' failures.
+    // verify_password uses constant-time comparison; do not log either value.
+    if core::auth::verify_password(&form.password, &expected) {
+        recover(state.login_limiter.lock()).record_success();
+        return redirect_with_cookie(&state, destination, &headers);
+    }
     {
-        let limiter = state.auth_limiter.lock().unwrap();
+        let limiter = recover(state.login_limiter.lock());
         if limiter.is_locked() {
             let mut resp = Html(render_login(&state.base_path, Some(LOGIN_LOCKED), Some(destination), chinese))
             .into_response();
@@ -1454,24 +1514,36 @@ async fn login_submit(
             return with_security_headers(resp);
         }
     }
-    if core::auth::verify_password(&form.password, &expected) {
-        state.auth_limiter.lock().unwrap().record_success();
-        redirect_with_cookie(&state, destination, &headers)
-    } else {
-        state.auth_limiter.lock().unwrap().record_failure();
-        let body = render_login(&state.base_path, Some(LOGIN_WRONG), Some(destination), chinese);
-        let mut resp = Html(body).into_response();
-        *resp.status_mut() = StatusCode::UNAUTHORIZED;
-        with_security_headers(resp)
-    }
+    recover(state.login_limiter.lock()).record_failure();
+    let body = render_login(
+        &state.base_path,
+        Some(LOGIN_WRONG),
+        Some(destination),
+        chinese,
+    );
+    let mut resp = Html(body).into_response();
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    with_security_headers(resp)
 }
 
 /// 303-redirect to `to`, setting a fresh session cookie (Secure iff the request
 /// arrived over HTTPS — see `request_is_https`).
 fn redirect_with_cookie(state: &AppState, to: &str, headers: &HeaderMap) -> Response {
     let secure = request_is_https(state, headers);
+    let cookie = match make_session_cookie(state, secure) {
+        Ok(cookie) => cookie,
+        Err(_) => {
+            return with_security_headers(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "secure session generation unavailable",
+                )
+                    .into_response(),
+            )
+        }
+    };
     let mut resp = Redirect::to(&based(state, to)).into_response();
-    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(state, secure)) {
+    if let Ok(v) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     with_security_headers(resp)
@@ -1547,13 +1619,28 @@ async fn pair_new(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
+    if let Some(base) = &state.public_url {
+        let code = state.pairing.issue();
+        let url = format!("{}/pair?c={code}", base.trim_end_matches('/'));
+        let host = reqwest::Url::parse(base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned));
+        return pair_json(
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true, "url": url, "host": host, "hosts": [host],
+                "expires_in_secs": crate::pairing::CODE_TTL.as_secs(),
+                "svg": crate::pairing::qr_svg(&url),
+            }),
+        );
+    }
     if !state.pairing.lan_reachable {
         return pair_json(
             StatusCode::CONFLICT,
             serde_json::json!({
                 "ok": false,
                 "error": "loopback_only",
-                "hint": "this Mac only listens on 127.0.0.1, so a phone cannot reach it; set IPHONE_USE_HOST=0.0.0.0 (re-run install.sh and allow LAN access)"
+                "hint": "local-only mode: first configure authenticated HTTPS (IPHONE_USE_PUBLIC_URL or an HTTPS relay), distinct credentials and IPHONE_USE_REMOTE_ACCESS=1; do not expose a plain HTTP listener"
             }),
         );
     }
@@ -1643,7 +1730,9 @@ async fn agent_login_link(State(state): State<Arc<AppState>>, headers: HeaderMap
         "http://127.0.0.1{port}/pair?c={}&to=browser",
         state.pairing.issue()
     );
-    let lan_url = if state.pairing.lan_reachable {
+    let lan_url = if let Some(base) = &state.public_url {
+        Some(format!("{}/pair?c={}", base.trim_end_matches('/'), state.pairing.issue()))
+    } else if state.pairing.lan_reachable {
         crate::pairing::lan_addresses()
             .into_iter()
             .next()
@@ -1760,7 +1849,10 @@ async fn pair_page(
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let base = format!("{scheme}://{host}{}", state.base_path);
+    let base = state
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("{scheme}://{host}{}", state.base_path));
     let app_link = format!("iphoneuse://pair?u={}&amp;c={code}", percent_encode(&base));
     let body = format!(
         r#"<h1>连接这台 Mac 上的 iPhone</h1>
@@ -1792,7 +1884,30 @@ async fn pair_submit(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("application/json"));
-    if state.auth_limiter.lock().unwrap().is_locked() {
+    let req: PairJson = if is_json {
+        serde_json::from_slice(&body).unwrap_or_default()
+    } else {
+        PairJson {
+            code: Some(pair_form_code(&body)),
+            device_token: None,
+        }
+    };
+    // Redeem a one-time code exactly once, before testing the failure bucket.
+    // Renewal uses an authenticated token, never an anonymous rate-limit key.
+    let credential_valid = if let Some(code) = req.code.as_deref() {
+        pair_code_shape_ok(code) && state.pairing.redeem(code)
+    } else if let Some(token) = req.device_token.as_deref() {
+        core::auth::verified_subject(&device_key(&state), token, now_secs()).is_some_and(
+            |subject| {
+                recover(state.credentials.lock())
+                    .authorize(&state.secret, "device", &subject, now_secs())
+                    .is_some()
+            },
+        )
+    } else {
+        false
+    };
+    if !credential_valid && recover(state.pair_limiter.lock()).is_locked() {
         let mut resp = if is_json {
             pair_json(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1814,35 +1929,37 @@ async fn pair_submit(
     let secure = request_is_https(&state, &headers);
 
     if !is_json {
-        let code = pair_form_code(&body);
-        if pair_code_shape_ok(&code) && state.pairing.redeem(&code) {
-            state.auth_limiter.lock().unwrap().record_success();
+        if credential_valid {
+            recover(state.pair_limiter.lock()).record_success();
             return redirect_with_cookie(&state, "/phone", &headers);
         }
-        state.auth_limiter.lock().unwrap().record_failure();
+        recover(state.pair_limiter.lock()).record_failure();
         let chinese = crate::locale::request_prefers_chinese(&headers);
         let mut resp = Html(pair_expired_html(chinese)).into_response();
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         return with_security_headers(resp);
     }
 
-    let req: PairJson = serde_json::from_slice(&body).unwrap_or_default();
-    let device_token = if let Some(code) = req.code.as_deref() {
-        if !(pair_code_shape_ok(code) && state.pairing.redeem(code)) {
-            state.auth_limiter.lock().unwrap().record_failure();
+    let device_token = if req.code.is_some() {
+        if !credential_valid {
+            recover(state.pair_limiter.lock()).record_failure();
             return pair_json(
                 StatusCode::UNAUTHORIZED,
                 serde_json::json!({"ok": false, "error": "pairing_code_invalid", "hint": "the code was already used or is older than 5 minutes; scan a fresh QR code"}),
             );
         }
-        Some(core::auth::make_token(
+        let minted = core::auth::try_make_token(
             &device_key(&state),
             crate::pairing::DEVICE_TOKEN_TTL_SECS,
             now_secs(),
-        ))
-    } else if let Some(token) = req.device_token.as_deref() {
-        if !core::auth::check_token(&device_key(&state), token, now_secs()) {
-            state.auth_limiter.lock().unwrap().record_failure();
+        );
+        match minted {
+            Ok(token) => Some(token),
+            Err(_) => return pair_json(StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({"ok":false,"error":"secure_token_unavailable"})),
+        }
+    } else if req.device_token.is_some() {
+        if !credential_valid {
+            recover(state.pair_limiter.lock()).record_failure();
             return pair_json(
                 StatusCode::UNAUTHORIZED,
                 serde_json::json!({"ok": false, "error": "device_token_invalid", "hint": "the pairing expired or the control password changed; scan a new QR code"}),
@@ -1851,10 +1968,15 @@ async fn pair_submit(
         // Sliding: every renewal hands back a fresh token, so a phone that
         // connects at least once per token lifetime stays paired for good
         // (remote control is often needed when nobody can reach the phone).
-        Some(core::auth::make_token(
+        let subject = req.device_token.as_deref().and_then(|token| core::auth::verified_subject(&device_key(&state), token, now_secs()));
+        let Some(subject) = subject else {
+            return pair_json(StatusCode::UNAUTHORIZED, serde_json::json!({"ok":false,"error":"device_token_invalid"}));
+        };
+        Some(core::auth::token_for_subject(
             &device_key(&state),
             crate::pairing::DEVICE_TOKEN_TTL_SECS,
             now_secs(),
+            &subject,
         ))
     } else {
         return pair_json(
@@ -1862,7 +1984,7 @@ async fn pair_submit(
             serde_json::json!({"ok": false, "error": "invalid_request", "hint": "send {\"code\"} or {\"device_token\"}"}),
         );
     };
-    state.auth_limiter.lock().unwrap().record_success();
+    recover(state.pair_limiter.lock()).record_success();
     let mut body = serde_json::json!({"ok": true, "session_ttl_secs": state.session_ttl_secs});
     // Direct addresses for an app that paired through a tunnel: it probes
     // them and drives the phone over the LAN when it can, the paired address
@@ -1889,12 +2011,48 @@ async fn pair_submit(
         crate::pairing::lan_key(&device_key(&state)),
     )
     .into();
-    if let Some(token) = device_token {
+    let Some(token) = device_token else {
+        return pair_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok":false,"error":"secure_token_unavailable"}),
+        );
+    };
+    let Some(subject) = core::auth::verified_subject(&device_key(&state), &token, now_secs())
+    else {
+        return pair_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok":false,"error":"secure_token_unavailable"}),
+        );
+    };
+    if recover(state.credentials.lock())
+        .register(
+            &state.secret,
+            "device",
+            &subject,
+            "Paired device",
+            crate::credentials::Scope::Control,
+            now_secs(),
+        )
+        .is_err()
+    {
+        return pair_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok":false,"error":"credential_registration_failed"}),
+        );
+    }
+    body["public_url"] = serde_json::json!(state.public_url);
+    let session = core::auth::token_for_subject(
+        &state.secret,
+        state.session_ttl_secs,
+        now_secs(),
+        &format!("device-{subject}"),
+    );
+    {
         body["device_token"] = serde_json::Value::String(token);
         body["device_token_ttl_secs"] = crate::pairing::DEVICE_TOKEN_TTL_SECS.into();
     }
     let mut resp = pair_json(StatusCode::OK, body);
-    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(&state, secure)) {
+    if let Ok(v) = HeaderValue::from_str(&session_cookie_for_token(&state, secure, &session)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
@@ -1903,12 +2061,14 @@ async fn pair_submit(
 #[derive(Default, Deserialize)]
 struct ProbeQuery {
     n: Option<String>,
+    /// The exact HTTPS base URL a new client proposes to trust. Legacy probes
+    /// omit this, but their nonce-only proof must never authorize migration.
+    u: Option<String>,
 }
 
-/// `GET /pair/probe?n=<nonce>` — unauthenticated, so a paired app can tell
-/// whether a LAN address is really this daemon *before* it sends a session
-/// cookie there in cleartext: the answer is an HMAC of the nonce under the
-/// `lan_key` the app received with its session.
+/// An unauthenticated identity probe, never permission to send credentials in
+/// cleartext. New clients bind the proof to the configured HTTPS endpoint;
+/// forwarding a challenge from an unrelated TLS server cannot authorize it.
 async fn pair_probe(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ProbeQuery>,
@@ -1920,11 +2080,33 @@ async fn pair_probe(
             serde_json::json!({"ok": false, "error": "invalid_nonce"}),
         );
     }
+    let proof = match query.u {
+        Some(target) => {
+            let approved = state
+                .public_url
+                .as_deref()
+                .and_then(|url| crate::remote_access::https_url(url).ok());
+            let proposed = crate::remote_access::https_url(&target).ok();
+            if !approved.zip(proposed).is_some_and(|(a, b)| {
+                a.as_str().trim_end_matches('/') == b.as_str().trim_end_matches('/')
+            }) {
+                return pair_json(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"ok":false,"error":"unapproved_https_endpoint"}),
+                );
+            }
+            core::auth::sign(
+                &crate::pairing::lan_key(&device_key(&state)),
+                &format!("iphone-use-route-v2\n{nonce}\n{target}"),
+            )
+        }
+        None => crate::pairing::lan_proof(&device_key(&state), &nonce),
+    };
     pair_json(
         StatusCode::OK,
         serde_json::json!({
             "ok": true,
-            "proof": crate::pairing::lan_proof(&device_key(&state), &nonce),
+            "proof": proof,
         }),
     )
 }
@@ -1980,6 +2162,26 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// shared `auth_limiter` themselves so the limiter covers both login and agent
 /// paths with a unified counter.
 fn check_bearer(state: &AppState, headers: &HeaderMap) -> bool {
+    if state.agent_token.is_none() && state.password.is_none() {
+        return true;
+    }
+    bearer_record(state, headers).is_some()
+}
+
+/// Per-agent tokens are independent. The compatibility shared bearer remains
+/// one explicit, revocable legacy identity, never a client-selected owner.
+fn bearer_record(state: &AppState, headers: &HeaderMap) -> Option<crate::credentials::Record> {
+    let supplied = bearer_credential(headers)?;
+    if let Ok(token) = std::str::from_utf8(supplied) {
+        if token.starts_with("ipu_agent_") {
+            return recover(state.credentials.lock()).authorize(
+                &state.secret,
+                "agent",
+                token,
+                now_secs(),
+            );
+        }
+    }
     // Determine which secret governs bearer auth.
     let expected: &str = match (&state.agent_token, &state.password) {
         // Dedicated agent token takes precedence; password is NOT accepted.
@@ -1987,9 +2189,12 @@ fn check_bearer(state: &AppState, headers: &HeaderMap) -> bool {
         // No dedicated token → fall back to the password (original behavior).
         (None, Some(pw)) => pw,
         // Open mode (neither configured) → always authed.
-        (None, None) => return true,
+        (None, None) => return None,
     };
-    bearer_credential(headers).is_some_and(|token| ct_eq(token, expected.as_bytes()))
+    if !ct_eq(supplied, expected.as_bytes()) {
+        return None;
+    }
+    recover(state.credentials.lock()).authorize(&state.secret, "legacy-agent", expected, now_secs())
 }
 
 /// Outcome of an agent auth check (combines lockout + credential verify).
@@ -2004,7 +2209,7 @@ enum AgentAuth {
 
 /// Check the agent bearer token and advance the rate limiter.
 ///
-/// * Checks the limiter BEFORE credential verification.
+/// * Verifies a credential before applying the failure-only limiter.
 /// * Records a failure (wrong or missing bearer) or success (correct) in the
 ///   shared [`AuthLimiter`].
 /// * Open-mode (neither `agent_token` nor `password` configured): always returns
@@ -2015,32 +2220,27 @@ fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
         crate::timing::authenticated();
         return AgentAuth::Ok;
     }
+    if check_bearer(state, headers) {
+        recover(state.auth_limiter.lock()).record_success();
+        crate::timing::authenticated();
+        return AgentAuth::Ok;
+    }
     {
-        let limiter = state.auth_limiter.lock().unwrap();
+        let limiter = recover(state.auth_limiter.lock());
         if limiter.is_locked() {
             return AgentAuth::Locked;
         }
     }
-    if check_bearer(state, headers) {
-        state.auth_limiter.lock().unwrap().record_success();
-        // Only now does the request count for task metrics.
-        crate::timing::authenticated();
-        AgentAuth::Ok
-    } else {
-        state.auth_limiter.lock().unwrap().record_failure();
-        AgentAuth::Denied
-    }
+    recover(state.auth_limiter.lock()).record_failure();
+    AgentAuth::Denied
 }
 
 /// Would this request authenticate? Read-only: it neither advances the auth
 /// limiter nor registers anything, so wrappers can decide whether to act
 /// on the caller's behalf without changing state for a refused request.
-fn credentials_ok(state: &AppState, headers: &HeaderMap) -> bool {
+pub(crate) fn credentials_ok(state: &AppState, headers: &HeaderMap) -> bool {
     if state.agent_token.is_none() && state.password.is_none() {
         return true;
-    }
-    if state.auth_limiter.lock().is_ok_and(|limiter| limiter.is_locked()) {
-        return false;
     }
     is_authed(state, headers) || check_bearer(state, headers)
 }
@@ -2050,9 +2250,6 @@ fn credentials_ok(state: &AppState, headers: &HeaderMap) -> bool {
 fn bearer_ok(state: &AppState, headers: &HeaderMap) -> bool {
     if state.agent_token.is_none() && state.password.is_none() {
         return true;
-    }
-    if state.auth_limiter.lock().is_ok_and(|limiter| limiter.is_locked()) {
-        return false;
     }
     check_bearer(state, headers)
 }
@@ -16078,7 +16275,7 @@ fn agent_json_response(status: StatusCode, body: serde_json::Value) -> Response 
 /// pairs and renews a session, like the web page). Writes still need
 /// `X-Phone-Control`, which a cross-site form cannot send.
 fn agent_auth_refusal(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    if is_authed(state, headers) && !state.auth_limiter.lock().is_ok_and(|limiter| limiter.is_locked()) {
+    if is_authed(state, headers) {
         crate::timing::authenticated();
         return None;
     }
@@ -16290,6 +16487,22 @@ async fn agent_flow_run(
 
 /// `POST /agent/task` — hand the daemon a goal (docs/agent-task.md). 202 with
 /// the task id; 409 `task_running` while another task runs.
+/// Derive a task principal exclusively from authenticated credentials. Display
+/// owner headers and JSON fields never participate in authorization. Renewed
+/// device sessions preserve their signed subject, not the bearer text/expiry.
+fn task_principal(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    authenticated_record(state, headers).map(|record| record.id)
+}
+
+/// Refuse unauthenticated development-mode task ownership as well. A local
+/// process may configure a credential; a web request cannot invent one.
+fn task_identity_required() -> Response {
+    agent_json_response(
+        StatusCode::UNAUTHORIZED,
+        serde_json::json!({"ok":false,"error":"authenticated_task_identity_required"}),
+    )
+}
+
 async fn agent_task_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -16310,6 +16523,10 @@ async fn agent_task_start(
             )
         }
     };
+    let Some(principal) = task_principal(&state, &headers) else {
+        return task_identity_required();
+    };
+    request.principal = principal.clone();
     if request.app.is_none() {
         request.app = crate::app_lookup::starting_app(&request.goal);
         request.app_fresh = request.app.is_some();
@@ -16331,7 +16548,7 @@ async fn agent_task_start(
         Ok(id) => agent_json_response(StatusCode::ACCEPTED, serde_json::json!({"ok": true, "id": id, "status": "running"})),
         Err(iphone_use_mcp::task::StartError::Busy(id)) => agent_json_response(
             StatusCode::CONFLICT,
-            serde_json::json!({"ok": false, "error": "task_running", "id": id}),
+            serde_json::json!({"ok": false, "error": "task_running", "id": iphone_use_mcp::task::get_for(&id, None, &principal).map(|_| id)}),
         ),
         Err(iphone_use_mcp::task::StartError::Invalid(message)) => agent_json_response(
             StatusCode::BAD_REQUEST,
@@ -16351,7 +16568,10 @@ async fn agent_task_get(
         return refusal;
     }
     let since = query.get("since").and_then(|v| v.parse().ok());
-    match iphone_use_mcp::task::get(&id, since) {
+    let Some(principal) = task_principal(&state, &headers) else {
+        return task_identity_required();
+    };
+    match iphone_use_mcp::task::get_for(&id, since, &principal) {
         Some(mut task) => {
             task["ok"] = serde_json::json!(true);
             agent_json_response(StatusCode::OK, task)
@@ -16373,23 +16593,52 @@ async fn agent_task_act(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
-    let result = match verb.as_str() {
-        "confirm" => {
-            let approve = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("approve").and_then(serde_json::Value::as_bool));
-            let Some(approve) = approve else {
-                return agent_json_response(
-                    StatusCode::BAD_REQUEST,
-                    serde_json::json!({"ok": false, "error": "invalid_request", "message": "send {\"approve\": true|false}"}),
-                );
-            };
-            iphone_use_mcp::task::answer(&id, approve)
+    let Some(principal) = task_principal(&state, &headers) else {
+        return task_identity_required();
+    };
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let result = if verb == "takeover" {
+        let password = payload["admin_password"].as_str().unwrap_or("");
+        let reason = payload["reason"].as_str().unwrap_or("").trim();
+        if !state.password.as_deref().is_some_and(|expected| {
+            !password.is_empty() && core::auth::verify_password(password, expected)
+        }) {
+            recover(state.login_limiter.lock()).record_failure();
+            return agent_json_response(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"ok":false,"error":"administrator_reauthentication_required"}),
+            );
         }
-        "cancel" => iphone_use_mcp::task::cancel(&id),
-        "pause" => iphone_use_mcp::task::pause(&id, true),
-        "resume" => iphone_use_mcp::task::pause(&id, false),
-        _ => return agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
+        if reason.is_empty() || reason.len() > 500 {
+            return agent_json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok":false,"error":"takeover_reason_required"}),
+            );
+        }
+        let result = iphone_use_mcp::task::take_over(&id, &principal);
+        if result.is_ok() {
+            // No credential or free-form reason is logged. The digest can be
+            // matched to an operator's record without leaking its contents.
+            tracing::warn!(task = %id, principal = %principal, reason_digest = %core::auth::sign(&state.secret, reason), "administrator took over task; no pending action was approved");
+        }
+        result
+    } else {
+        if verb == "confirm"
+            && (payload["approve"].as_bool().is_none()
+                || payload["confirmation_id"].as_str().is_none())
+        {
+            return agent_json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok":false,"error":"confirmation_id_required","message":"send approve and the confirmation_id from the exact displayed prompt"}),
+            );
+        }
+        iphone_use_mcp::task::act_for(
+            &id,
+            &principal,
+            &verb,
+            payload["approve"].as_bool(),
+            payload["confirmation_id"].as_str(),
+        )
     };
     match result {
         Ok(()) => agent_json_response(StatusCode::OK, serde_json::json!({"ok": true})),
@@ -16403,7 +16652,10 @@ async fn agent_tasks(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     if let Some(refusal) = agent_auth_refusal(&state, &headers) {
         return refusal;
     }
-    agent_json_response(StatusCode::OK, iphone_use_mcp::task::list())
+    let Some(principal) = task_principal(&state, &headers) else {
+        return task_identity_required();
+    };
+    agent_json_response(StatusCode::OK, iphone_use_mcp::task::list_for(&principal))
 }
 
 /// Validate and install `flow` as local flow `id` (the same check and store as
@@ -26024,7 +26276,7 @@ mod tests {
         // Two daemons under different base paths on one host: the browser
         // sends both `phone_session` cookies; ours may come second.
         let state = fixture_app_state(Some("pw"));
-        let ours = make_session_cookie(&state, false);
+        let ours = make_session_cookie(&state, false).unwrap();
         let token = ours
             .strip_prefix("phone_session=")
             .and_then(|rest| rest.split(';').next())
@@ -26346,7 +26598,7 @@ mod tests {
             invalid.insert(header::COOKIE, HeaderValue::from_static("phone_session=invalid"));
             assert_eq!(agent_flow_draft(State(state.clone()), invalid).await.status(), StatusCode::UNAUTHORIZED);
             let mut headers = HeaderMap::new();
-            headers.insert(header::COOKIE, HeaderValue::from_str(&make_session_cookie(&state, false)).unwrap());
+            headers.insert(header::COOKIE, HeaderValue::from_str(&make_session_cookie(&state, false).unwrap()).unwrap());
             let response = agent_flow_draft(State(state), headers).await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();

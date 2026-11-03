@@ -22,20 +22,53 @@ pub struct StateInputs<'a> {
 }
 
 /// The daemon's state, as `iphone-use serve` and the embedded daemon build it.
-pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
-    Arc::new(AppState {
+pub fn app_state(inputs: StateInputs<'_>) -> Result<Arc<AppState>> {
+    let credentials = crate::credentials::Store::open(&crate::instance::current().state_dir)
+        .context("open persistent credential revocation state")?;
+    let public_url = inputs.cfg.public_url.clone().or_else(|| {
+        crate::relay_client::public_url(
+            inputs.cfg.relay_url.as_deref()?,
+            &crate::instance::current().state_dir,
+        )
+    });
+    let base_path = if inputs.cfg.base_path.is_empty() {
+        public_url
+            .as_deref()
+            .and_then(|u| reqwest::Url::parse(u).ok())
+            .map(|u| u.path().trim_end_matches('/').to_string())
+            .unwrap_or_default()
+    } else {
+        inputs.cfg.base_path.clone()
+    };
+    Ok(Arc::new(AppState {
+        credentials: Mutex::new(credentials),
         password: inputs.cfg.password.clone(),
         secret: inputs.secret,
         session_ttl_secs: inputs.cfg.session_ttl_secs,
-        // The daemon always serves plain HTTP; whether the cookie is marked
-        // `Secure` is decided per-request from `X-Forwarded-Proto` (the
-        // Cloudflare tunnel sets it to https). Binding to a LAN IP (0.0.0.0) is
-        // still plain HTTP, so forcing Secure here would make browsers reject
-        // the cookie over LAN. Keep this `false`; per-request HTTPS is detected
-        // in http.rs.
+        // HTTP is loopback only; trusted ingress metadata determines Secure
+        // cookies. A supplied Host or Forwarded header is not transport proof.
         cookie_secure: false,
-        base_path: inputs.cfg.base_path.clone(),
+        base_path,
+        allowed_hosts: {
+            let mut hosts = vec!["localhost".into(), "127.0.0.1".into(), "::1".into(), inputs.cfg.host.trim_matches(['[', ']']).to_ascii_lowercase()];
+            hosts.extend(crate::pairing::lan_addresses().into_iter().map(|(_, ip)| ip.to_string()));
+            if let Some(host) = public_url.as_deref().and_then(|u| reqwest::Url::parse(u).ok()).and_then(|u| u.host_str().map(str::to_owned)) {
+                hosts.push(host.trim_matches(['[', ']']).to_ascii_lowercase());
+            }
+            if let Some(relay) = &inputs.cfg.relay_url {
+                if let Ok(url) = crate::security::relay_base(relay) {
+                    if let Some(host) = url.host_str() { hosts.push(host.trim_matches(['[', ']']).to_ascii_lowercase()); }
+                }
+            }
+            hosts
+        },
+        trusted_proxy_ips: inputs.cfg.trusted_proxy_ips.iter().filter_map(|ip| ip.parse().ok()).collect(),
+        login_admission: Mutex::new(crate::browser_boundary::LoginAdmission::default()),
+        admin_admission: Mutex::new(crate::browser_boundary::LoginAdmission::default()),
+        public_url,
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
+        login_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
+        pair_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: inputs.cfg.agent_token.clone(),
         device_udid: inputs.cfg.device_udid.clone(),
         simulator: inputs.simulator,
@@ -89,7 +122,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
         owner_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         owner_lease_secs: inputs.cfg.owner_lease_secs,
         runner_bootstrap: crate::http::write_and_bootstrap_runner_agent,
-    })
+    }))
 }
 
 /// How the device runner configures the daemon it hosts on the phone.
@@ -121,7 +154,7 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     let host = options.host.clone();
     let password = options.password.clone();
     let agent_token = options.agent_token.clone();
-    let cfg = Config::from_map(|key| match key {
+    let mut cfg = Config::from_map(|key| match key {
         "IPHONE_USE_HOST" => Some(host.clone()),
         "IPHONE_USE_PORT" => Some(port.clone()),
         "IPHONE_USE_PASSWORD" => password.clone(),
@@ -137,6 +170,17 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     instance
         .verify_on_disk()
         .map_err(|error| anyhow::anyhow!(error))?;
+    let documents =
+        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Documents"));
+    cfg.relay_url = relay_url(documents.as_deref());
+    // A relay.json written by explicit setup is a saved remote opt-in. Pin it
+    // for this process so routing, origin policy and TLS cannot drift apart.
+    if cfg.relay_url.is_some() {
+        cfg.remote_enabled = true;
+    }
+    crate::remote_access::apply(&mut cfg, &instance.state_dir)?;
+    crate::security::validate_startup(&cfg, cfg.remote_enabled, cfg.relay_url.is_some())
+        .map_err(anyhow::Error::msg)?;
     if let Some(token) = &options.runner_token {
         crate::runner_token::write(&instance.state_dir, token)
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -154,7 +198,7 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
         managed_runner: false,
         managed_runner_pending: false,
         simulator: None,
-    });
+    })?;
 
     // The runner mints pairing codes for the iPhone app on this same phone
     // through `embedded_pair_code`, in-process: the app is a loopback client,
@@ -162,7 +206,6 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     let _ = EMBEDDED_PAIRING.set(state.pairing.clone());
     // A Mac connecting another phone over USB (`setup-app --connect-to`)
     // drops a one-time code into Documents and reads back where we listen.
-    let documents = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Documents"));
     if let Some(documents) = &documents {
         state.pairing.set_drop_file(documents.join("connect-code-import.json"));
     }
@@ -176,6 +219,8 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
         let listener = tokio::net::TcpListener::bind((cfg.host.as_str(), cfg.port))
             .await
             .with_context(|| format!("bind {}:{}", cfg.host, cfg.port))?;
+        crate::security::validate_bound_address(&cfg, listener.local_addr()?)
+            .map_err(anyhow::Error::msg)?;
         tracing::info!(
             "embedded daemon on {}:{} → runner {runner_url}",
             cfg.host,
@@ -191,10 +236,11 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
         crate::keep_awake::spawn(state.clone());
         crate::lock_readiness::spawn(state.clone());
         let relay_url = {
-            let documents = documents.clone();
-            move || relay_url(documents.as_deref())
+            let relay = cfg.relay_url.clone();
+            move || relay.clone()
         };
-        crate::relay_client::spawn(relay_url.clone(), instance.state_dir.clone(), cfg.port);
+        crate::relay_client::spawn(relay_url.clone(), instance.state_dir.clone(), cfg.port,
+            core::auth::sign(&state.secret, "relay-ingress-v1"), state.public_url.clone());
         if let Some(documents) = documents {
             let pairing = state.pairing.clone();
             let port = cfg.port;
@@ -212,7 +258,7 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
             });
         }
         spawn_registry_refresh_in_process();
-        axum::serve(listener, http::router(state))
+        axum::serve(listener, http::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .context("axum serve")
     })
@@ -226,7 +272,9 @@ fn relay_url(documents: Option<&std::path::Path>) -> Option<String> {
         let text = std::fs::read_to_string(documents?.join("relay.json")).ok()?;
         serde_json::from_str::<serde_json::Value>(&text).ok()?["url"].as_str().map(String::from)
     })?;
-    (url.starts_with("https://") || url.starts_with("http://127.0.0.1")).then_some(url)
+    crate::security::relay_base(&url)
+        .ok()
+        .map(|u| u.to_string())
 }
 
 /// The embedded daemon's pairing, once it is built.

@@ -368,7 +368,7 @@ jobs:
         if: ${{ env.HAS_SIGNING != 'true' }}
         run: |
           echo "No APPLE_SIGNING_CERTIFICATE secret — shipping unsigned .app."
-          echo "install.sh will create a local self-signed cert on the user's machine."
+          echo "A reviewed local installation may apply ad-hoc signing without creating or unlocking a private key."
 
       # ── Package ────────────────────────────────────────────────────────────
       - name: Zip .app bundle

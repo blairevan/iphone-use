@@ -1145,7 +1145,10 @@ impl Scheduler {
                         &daemon,
                         &schedule.target,
                         &inputs,
-                        schedule.confirm_side_effects,
+                        // A stored boolean cannot approve a newly downloaded
+                        // implementation. Scheduled runs require the exact local
+                        // invocation approval, rechecked by the shared executor.
+                        false,
                     ),
                 )
                 .await;
@@ -1195,7 +1198,7 @@ impl Scheduler {
             args.push("--input".into());
             args.push(format!("{name}={value}"));
         }
-        if schedule.confirm_side_effects {
+        if schedule.kind == JobKind::Test && schedule.confirm_side_effects {
             args.push("--confirm".into());
         }
         args.push("--artifacts-dir".into());
@@ -2069,7 +2072,7 @@ mod tests {
     }
 
     #[test]
-    fn job_commands_pass_confirm_and_inputs_through() {
+    fn scheduled_flow_never_inherits_blanket_confirmation() {
         let mut job = schedule("s1", "* * * * *", None);
         job.inputs.insert("query".into(), "Health".into());
         job.confirm_side_effects = true;
@@ -2082,7 +2085,6 @@ mod tests {
                 "system/x",
                 "--input",
                 "query=Health",
-                "--confirm",
                 "--artifacts-dir",
                 "/tmp/a"
             ]

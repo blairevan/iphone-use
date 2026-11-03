@@ -92,10 +92,10 @@ certificate and provisioning profile, then rerun setup.
 ### Install and connect the first phone
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+bash install.sh ./iPhoneUse.app --no-setup
 ```
 
-The installer fetches the latest GitHub Release, registers a per-user LaunchAgent,
+The reviewed local installer registers a per-user LaunchAgent,
 writes the loopback runner endpoints, installs the matching agent skill, lays the
 device runner sources down at `~/.iphone-use/runner`, and links the `iphone-use`
 command into `~/.local/bin`. On a first install in a terminal it then carries on:
@@ -122,7 +122,7 @@ iphone-use login     # a new one-time browser sign-in and phone QR code
 
 `iphone-use setup` runs `~/.iphone-use/setup-runner.sh`, which also takes `status`, `pause`,
 `resume` and `stop` (`iphone-use setup status`). The control page is
-**`http://<mac-lan-ip>:44321/phone`**; **`/setup`** translates `/agent/status` into the
+**`http://127.0.0.1:44321/phone`** (on the Mac; other devices require the configured HTTPS entry point); **`/setup`** translates `/agent/status` into the
 current blocker (USB, trust, developer service, runner, external host) without changing
 your VPN or running setup for you.
 
@@ -130,7 +130,7 @@ More than one iPhone paired? Pin the same classic UDID in both places:
 
 ```bash
 export IPHONE_USE_UDID=00008…
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+bash install.sh ./iPhoneUse.app --no-setup
 IPU_RUNNER_UDID="$IPHONE_USE_UDID" ~/.iphone-use/setup-runner.sh
 ```
 
@@ -196,19 +196,19 @@ never against a hand-off, a setup blocker or another session, and at most once p
 > `IPHONE_USE_BACKEND=mirror` are served over runner after upgrading.
 
 ```bash
-iphone-use upgrade            # install the latest release (daemon + skill), then refresh other skill copies
+iphone-use upgrade            # notification only; does not install
 iphone-use upgrade --check    # change nothing: "iphone-use 0.6.6 -> 0.6.7" or "... is up to date"
 iphone-use upgrade --json     # the same as JSON: name, current, latest, update_available, skills
 ```
 
 The installer links `~/.local/bin/iphone-use` to the app's executable, so the command is on
-PATH once `~/.local/bin` is. `upgrade` runs the same `install.sh` one-liner as installing
-(which also refreshes the installer-managed skill), then runs
-`claude plugin update iphone-use@leeguooooo-plugins` or `git pull --ff-only` for a plugin
-or git-checkout copy of the skill; any other copy is reported as not release-matched, to be
-replaced by the installer's. Exit code `0` = upgraded / already current / check ran; `2` = the check or download
-failed. A `cargo build` binary is never replaced: `upgrade` prints the install command
-instead.
+PATH once `~/.local/bin` is. `upgrade`, `upgrade --check` and `upgrade --json`
+only report version information; they never replace programs, plugins or skills.
+The separate `release trust` / `release verify` / `release install --confirm` workflow
+verifies a complete signed offline bundle against an independently imported trust root,
+including root rotation, expiry and rollback constraints. No upstream key is trusted
+by default. See [signed releases](security/signed-releases.md) and the
+[verification status](security/hardening-status.md).
 
 The daemon checks GitHub daily and reports `version` / `latest` / `update_available` in
 `/agent/status`; the web client shows a banner. One-shot commands (`iphone-use stop`) print
@@ -218,30 +218,29 @@ timeout). `CI`, `IPHONE_USE_NO_UPDATE_CHECK` or `USE_NO_UPDATE_CHECK`
 turn off both the daily check and the notice. Details of
 what the installer verifies are under [Operations → Upgrades](#upgrades).
 
-**Automatic upgrades** are on by default and gated on the phone being idle. The installer
-registers a daily job (04:30) that upgrades every daemon on the Mac, the default instance and
-each `--instance`, when a newer release exists *and* nobody is using that phone: no
-`X-Phone-Owner` lease, no hold, the daemon is not releasing/reconnecting, no live viewer, and no
-agent request in the last 15 minutes (`idle_secs` on `/agent/status`; override with
-`AUTO_UPDATE_IDLE_SECS`). A connected phone with runner up but nobody driving it counts as idle.
-A busy phone is skipped until the next day; each decision is one line in
-`~/Library/Logs/iPhoneUse/auto-update.log`.
+**Unattended upgrades are disabled by default.** The installer persists the opt-out,
+disables the old `com.leeguoo.iphone-use.autoupdate` job and verifies its removal before
+deleting the plist. Legacy `IPHONE_USE_AUTO_UPDATE=1` no longer opts in. When an older
+updater is installing this release, future launches are disabled without killing that
+active transaction midway.
 
-The upgrade is the release's own `install.sh`, with its SHA-256 checks and rollback, and every
-setting in the daemon's plist is carried over. It succeeded when the restarted daemon reports
-the new version. The result lands in `~/.iphone-use/auto-update-last.json`, shown as
-`auto_update` on `/agent/status`, by `iphone-use doctor` and by `iphone-use upgrade --check`.
+The new `scripts/auto-update.sh` only checks versions and logs notices. It cannot run an
+installer, fall back to `main`, replace itself, re-sign an app or rebuild runner. Neither
+`--force` nor `--reinstall` restores those capabilities. Historical
+`auto-update-last.json` records remain historical; checking does not report an installation.
 
 ```bash
 ~/.iphone-use/auto-update.sh disable    # off, and it stays off across installs
-~/.iphone-use/auto-update.sh enable     # on again
-~/.iphone-use/auto-update.sh status     # on or off, what it would do now, the last result
+~/.iphone-use/auto-update.sh status     # schedule state and historical outcome
 ~/.iphone-use/auto-update.sh run --dry-run
 ```
 
-Installing with `--no-auto-update` (or `IPHONE_USE_AUTO_UPDATE=0`) turns it off the same way.
-With `CI`, `IPHONE_USE_NO_UPDATE_CHECK` or `USE_NO_UPDATE_CHECK` set the installer leaves the
-job as it is. `run --force` skips the idle gate; `run --reinstall` reinstalls the current release.
+These commands describe an installed, reviewed copy of the new script. Do not run `enable`
+on an old installed copy: it may still schedule executable upgrades. In the new script,
+`enable` explicitly schedules notification-only checks at 04:30; the installer does not
+register them automatically. Under `CI`, only the opt-out file is written and launchd is
+untouched. `IPHONE_USE_NO_UPDATE_CHECK` / `USE_NO_UPDATE_CHECK` no longer prevent retirement
+of an old upgrade job.
 
 ## Drive the phone from the browser
 
@@ -479,7 +478,7 @@ intents are off until you choose one of:
 
 | Return path | How | Trade-off |
 |---|---|---|
-| LAN bind | `IPHONE_USE_HOST=0.0.0.0` with the password **and** `IPHONE_USE_AGENT_TOKEN` set | Simplest; exposes the daemon's authenticated surface to your whole LAN. |
+| Authenticated HTTPS | Explicit remote profile, independent human/agent credentials, verified TLS endpoint | Keep the daemon on loopback; configure callbacks to the public HTTPS base. See [remote setup](security/remote-access.md). |
 | USB reverse tunnel | Forward a phone-side port back to the Mac loopback listener | No LAN exposure; more moving parts. |
 
 Fire-and-forget verbs work on plain loopback. Never bind `0.0.0.0` on an untrusted
@@ -926,7 +925,7 @@ being replaced.
 ### Upgrades
 
 ```bash
-iphone-use upgrade    # or: curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+iphone-use upgrade --check    # check only; independently review a fixed release and its installer before installation
 ```
 
 The installer resolves the release tag to one commit for helpers and the skill, fetches
@@ -950,7 +949,7 @@ environment and in an existing LaunchAgent plist; when both are set,
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `IPHONE_USE_HOST` / `IPHONE_USE_PORT` | `127.0.0.1` / `44321` | Listen address and port (`0.0.0.0` for LAN; a password is then mandatory). |
+| `IPHONE_USE_HOST` / `IPHONE_USE_PORT` | `127.0.0.1` / `44321` | Listen address and port; changing to a wildcard does not authorize remote plaintext HTTP. |
 | `IPHONE_USE_PASSWORD` | *(none)* | Browser login; doubles as the agent bearer only when no agent token is set. |
 | `IPHONE_USE_AGENT_TOKEN` | *(none)* | Dedicated agent bearer. When set, it is the **only** accepted bearer. |
 | `IPHONE_USE_UDID` | detected and persisted by the installer | Canonical iPhone for the managed runner and destructive commands. Requests cannot switch it; change the deployment and restart. Pass the same value as `IPU_RUNNER_UDID` to setup. |

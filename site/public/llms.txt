@@ -2,7 +2,7 @@
 
 > iphone-use lets AI agents use a real iPhone. A daemon on your Mac (macOS 15+, Xcode) drives an iPhone (iOS 15+) through its own XCTest device runner, over USB or Wi-Fi. Claude Code, Codex, Cursor, Claude Desktop or any MCP client reads the screen as text (an accessibility tree), taps, types and swipes in any app, including apps with no API. It also offers an HTTP agent API (`/agent/*`), a browser and iOS-app remote control for people, and saved per-app flows that replay with no model. Source-available under PolyForm Shield 1.0.0 (not an OSI open-source license); free to download.
 
-Install: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh`, then `iphone-use doctor` and `iphone-use try`.
+Install: `bash install.sh ./iPhoneUse.app --no-setup`, then `iphone-use doctor` and `iphone-use try`.
 
 ## Docs (English)
 

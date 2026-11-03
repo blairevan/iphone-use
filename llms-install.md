@@ -12,14 +12,14 @@ server. iphone-use is a macOS app with a daemon, not an npm or pip package: ther
 
 ## Steps
 
-1. Install. Run in a terminal on the Mac:
+1. Review a fixed source revision and build/package it locally, or use an independently provisioned trust root and the signed offline release workflow in `docs/security/signed-releases.md`. Never use a floating network installer. For an already reviewed and built local checkout, run in a terminal on the Mac:
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+   bash install.sh ./iPhoneUse.app --no-setup
    ```
 
    The installer puts the app at `~/Applications/iPhoneUse.app`, the CLI on the PATH as
-   `iphone-use`, sets the phone up when one is plugged in, and registers the MCP server with
+   `iphone-use`, keeps remote access and unattended upgrades disabled, and registers the MCP server with
    Claude Code (`claude mcp add-json -s user iphone-use …`) and Codex (`codex mcp add iphone-use …`)
    when those CLIs are present.
 

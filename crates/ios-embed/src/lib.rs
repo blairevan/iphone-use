@@ -65,6 +65,7 @@ pub extern "C" fn ipu_daemon_start(
                 )
                 .with_target(false)
                 .with_ansi(false)
+                .event_format(server::safe_log::PrivacyFormatter)
                 .try_init();
             match std::panic::catch_unwind(move || server::boot::serve_embedded(options)) {
                 Ok(Ok(())) => fail("embedded daemon stopped".into()),

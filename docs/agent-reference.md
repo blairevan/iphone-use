@@ -1458,9 +1458,9 @@ exists (or a command prints `iphone-use X is available`), tell the user once per
 session and offer `iphone-use upgrade` (`--check` / `--json` to look only). Only
 upgrade when asked: it restarts the daemon and ends any phone session. If the
 skill and the live API disagree (404, missing field), the skill is probably
-stale — `iphone-use upgrade` or the installer
-(`curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh`)
-installs daemon and skill from the same release. Plugin installs:
+stale — `iphone-use upgrade --check` only checks versions. A separately reviewed local installer
+(`bash install.sh ./iPhoneUse.app --no-setup`) or the independently trusted signed-bundle workflow
+installs daemon and skill from the same fixed release. Plugin installs:
 `claude plugin update iphone-use@leeguooooo-plugins`.
 
 `auto_update` on `/agent/status` is the daily automatic upgrade: `enabled`, and

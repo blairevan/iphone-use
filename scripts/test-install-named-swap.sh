@@ -42,6 +42,10 @@ ok_t "waits for the old job to go and probes identity + authenticated status"
 # --- probe_launchd_daemon against fakes --------------------------------------
 PROBE="$(sed -n '/^probe_launchd_daemon() {$/,/^}$/p' "$ROOT/install.sh")"
 [ -n "$PROBE" ] || bad "probe_launchd_daemon not found"
+# The production probe delegates credential escaping to this helper. Extract
+# both functions so the fixture exercises the same code as the installer.
+CURL_AUTH="$(sed -n '/^curl_auth_config() {$/,/^}$/p' "$ROOT/install.sh")"
+[ -n "$CURL_AUTH" ] || bad "curl_auth_config not found"
 BIN="$TMP/app/Contents/MacOS/iphone-use"
 mkdir -p "$TMP/bin" "$(dirname "$BIN")"
 UIDN="$(id -u)"
@@ -87,7 +91,8 @@ reset() {
 probe() {  # token
     PATH="$TMP/bin:/usr/bin:/bin" UID_NUM="$UIDN" \
         IPHONE_USE_LSOF_BIN="$TMP/bin/lsof" IPHONE_USE_PS_BIN="$TMP/bin/ps" \
-        /bin/bash -c "$PROBE
+        /bin/bash -c "$CURL_AUTH
+$PROBE
 probe_launchd_daemon gui/$UIDN/test.label \"$BIN\" 45999 http://127.0.0.1:45999/agent/status \"\$0\" && echo PID=\$PROBED_DAEMON_PID" "$1"
 }
 

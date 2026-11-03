@@ -234,7 +234,7 @@ final class DaemonClient: @unchecked Sendable {
         probe.timeoutIntervalForRequest = 0.6
         probe.timeoutIntervalForResource = 1
         probe.waitsForConnectivity = false
-        probeSession = URLSession(configuration: probe)
+        probeSession = URLSession(configuration: probe, delegate: DaemonRedirectPolicy(follow: true), delegateQueue: nil)
         let config = configuration ?? URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
@@ -242,7 +242,7 @@ final class DaemonClient: @unchecked Sendable {
         config.waitsForConnectivity = false
         // Each gesture is one small request; keep connections warm.
         config.httpMaximumConnectionsPerHost = 4
-        session = URLSession(configuration: config)
+        session = URLSession(configuration: config, delegate: DaemonRedirectPolicy(follow: true), delegateQueue: nil)
     }
 
     /// The daemon's base URL for whatever a person typed or pasted:
@@ -492,8 +492,8 @@ final class DaemonClient: @unchecked Sendable {
     // MARK: routes
 
     /// Saved public tunnel URLs can disappear while the same Mac is still
-    /// reachable locally. Authenticate on a LAN route only after its nonce
-    /// proof succeeds, before sending any saved password or device token.
+    /// reachable locally. Automatic alternatives must provide verified TLS as
+    /// well as the nonce proof; the proof authenticates identity, not transport.
     private func prepareAuthenticationRoute() async throws {
         let direct = await probeLAN()
         try Task.checkCancellation()
@@ -505,24 +505,12 @@ final class DaemonClient: @unchecked Sendable {
     /// credential: whoever else holds that IP on another network learns
     /// nothing, and is never sent the session.
     func probeLAN() async -> URL? {
-        let candidates = lanCandidates.filter { $0 != publicBase }
+        let candidates = lanCandidates.filter { $0 != publicBase && $0.scheme?.lowercased() == "https" }
         guard !candidates.isEmpty, let lanKey else { return nil }
-        let session = probeSession
         return await withTaskGroup(of: URL?.self) { group in
             for url in candidates {
                 group.addTask {
-                    let nonce = Data((0..<24).map { _ in UInt8.random(in: 0...255) }).base64URL
-                    var components = URLComponents(url: url.appendingPathComponent( "pair/probe"),
-                                                   resolvingAgainstBaseURL: false)
-                    components?.queryItems = [URLQueryItem(name: "n", value: nonce)]
-                    guard let probeURL = components?.url,
-                          let answer = try? await session.data(from: probeURL),
-                          (answer.1 as? HTTPURLResponse)?.statusCode == 200,
-                          let json = try? JSONSerialization.jsonObject(with: answer.0) as? [String: Any],
-                          let proof = json["proof"] as? String else { return nil }
-                    let expected = HMAC<SHA256>.authenticationCode(
-                        for: Data(nonce.utf8), using: SymmetricKey(data: lanKey))
-                    return Data(expected).base64URL == proof ? url : nil
+                    await self.provesIdentity(at: url, key: lanKey) ? url : nil
                 }
             }
             for await hit in group {
@@ -535,11 +523,35 @@ final class DaemonClient: @unchecked Sendable {
         }
     }
 
+    /// Validate a new saved address without disclosing any credential. TLS
+    /// validates the endpoint; the existing pairing proof authenticates this
+    /// particular daemon AND its approved address. A nonce-only proof can be
+    /// forwarded by another server and therefore never authorizes migration.
+    func provesIdentity(at url: URL, key: Data) async -> Bool {
+        guard url.scheme?.lowercased() == "https", url.user == nil, url.password == nil,
+              url.query == nil, url.fragment == nil else { return false }
+        let nonce = Data((0..<24).map { _ in UInt8.random(in: 0...255) }).base64URL
+        let base = url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var components = URLComponents(url: url.appendingPathComponent("pair/probe"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name:"n",value:nonce), URLQueryItem(name:"u",value:base)]
+        guard let target = components?.url,
+              let (data, response) = try? await probeSession.data(from: target),
+              (response as? HTTPURLResponse)?.statusCode == 200, data.count <= 4096,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String:Any],
+              let encoded = object["proof"] as? String,
+              let signature = Data(base64URL: encoded) else { return false }
+        let message = "iphone-use-route-v2\n\(nonce)\n\(base)"
+        return HMAC<SHA256>.isValidAuthenticationCode(signature, authenticating: Data(message.utf8), using: SymmetricKey(data:key))
+    }
+
     /// Send requests to `url` (a probed LAN address) or, with nil, to the
     /// paired address. Returns whether the route changed.
     @discardableResult
     func use(_ url: URL?) -> Bool {
         let target = url ?? publicBase
+        // Existing explicitly paired HTTP addresses remain migration-only;
+        // discovery may never downgrade a paired device to plaintext LAN.
+        guard target == publicBase || target.scheme?.lowercased() == "https" else { return false }
         return routes.withLock { routes in
             guard routes.active != target else { return false }
             routes.active = target
@@ -630,12 +642,25 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     private func transmit(_ request: URLRequest, followRedirects: Bool) async throws -> (Data, HTTPURLResponse) {
-        let delegate = followRedirects ? nil : NoRedirect()
+        if publicBase.scheme?.lowercased() == "https", request.url?.scheme?.lowercased() != "https" {
+            throw DaemonError.unreachable("Refusing to send a paired session over an insecure connection")
+        }
+        let delegate = DaemonRedirectPolicy(follow: followRedirects)
         let (data, response) = try await session.data(for: request, delegate: delegate)
         guard let http = response as? HTTPURLResponse else {
             throw DaemonError.unreachable("not HTTP")
         }
         return (data, http)
+    }
+
+    /// Redirects cannot carry session cookies to a different origin or lower
+    /// transport security. A new endpoint must be selected through pairing.
+    static func permitsRedirect(from: URL, to: URL) -> Bool {
+        func port(_ url: URL) -> Int { url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80) }
+        return from.scheme?.lowercased() == to.scheme?.lowercased()
+            && from.host?.lowercased() == to.host?.lowercased()
+            && port(from) == port(to)
+            && to.user == nil && to.password == nil
     }
 }
 
@@ -656,10 +681,16 @@ extension Data {
 }
 
 /// Keeps `/login`'s 303 visible so its Set-Cookie is read and the status checked.
-private final class NoRedirect: NSObject, URLSessionTaskDelegate {
+private final class DaemonRedirectPolicy: NSObject, URLSessionTaskDelegate {
+    private let follow: Bool
+
+    init(follow: Bool) { self.follow = follow }
+
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest) async -> URLRequest? {
-        nil
+        guard follow, let from = response.url, let to = request.url,
+              DaemonClient.permitsRedirect(from: from, to: to) else { return nil }
+        return request
     }
 }

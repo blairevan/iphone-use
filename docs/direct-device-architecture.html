@@ -896,7 +896,7 @@
           </li>
           <li>
             <b>安装 daemon</b>
-            <pre><code>curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code></pre>
+            <pre><code>bash install.sh ./iPhoneUse.app --no-setup</code></pre>
             安装器会停止旧 daemon、保留密码和受支持的配置，并写入 loopback runner endpoints。runner 尚未验证时，
             daemon 仍启动其 HTTP/登录/状态控制面，但明确报告设备层 offline；不会假装 runner 已就绪。
           </li>

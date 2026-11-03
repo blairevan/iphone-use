@@ -84,7 +84,7 @@
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
           <span class="du-code-name">bash</span>
         </div>
-<pre><code><span class="du-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code></pre>
+<pre><code><span class="du-prompt">$</span> bash install.sh ./iPhoneUse.app --no-setup</code></pre>
       </div>
 
       <h3>安装脚本做了什么</h3>
@@ -107,7 +107,7 @@
 <span class="du-prompt">$</span> iphone-use setup     <span class="du-cmt"># 重新配置手机（换了 iPhone 或 Xcode 之后）</span>
 <span class="du-prompt">$</span> iphone-use try       <span class="du-cmt"># 无害的检查：打开设置、读屏、回桌面</span>
 <span class="du-prompt">$</span> iphone-use login     <span class="du-cmt"># 重新登录浏览器，附手机扫码用的二维码</span>
-<span class="du-prompt">$</span> iphone-use upgrade   <span class="du-cmt"># 升级全部组件</span>
+<span class="du-prompt">$</span> iphone-use upgrade   <span class="du-cmt"># 只检查版本，不安装</span>
 <span class="du-prompt">$</span> ~/.iphone-use/uninstall.sh --dry-run   <span class="du-cmt"># 看卸载会删掉什么（去掉 --dry-run 就真的卸载）</span></code></pre>
       </div>
 
@@ -128,7 +128,7 @@
           <span class="du-code-name">提示词</span>
         </div>
 <pre><code>在这台 Mac 上安装 iphone-use（https://github.com/leeguooooo/iphone-use），让你能操作我的 iPhone。
-1. 运行：curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+1. 运行：bash install.sh ./iPhoneUse.app --no-setup
 2. 运行 `iphone-use doctor`。终端里能修的直接修；它让你运行 `iphone-use setup` 时就运行。
 3. 有几步只能我自己做：在 Xcode 里登录 Apple ID、在 iPhone 上点「信任」、打开开发者模式、
    解锁手机。遇到这些就停下，告诉我具体怎么做，等我说做完了再继续。不要向我要密码或验证码。
@@ -158,18 +158,19 @@
       <hr class="du-divider" />
 
       <h2>升级</h2>
+      <p>首次安装必须先审查固定源码并本地构建 <code>iPhoneUse.app</code>，再执行本地安装器；不直接执行浮动网络下载。</p>
       <div class="du-code">
         <div class="du-code-head">
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
           <span class="du-code-name">bash</span>
         </div>
-<pre><code><span class="du-prompt">$</span> iphone-use upgrade            <span class="du-cmt"># 安装最新版本（守护进程 + skill）</span>
+<pre><code><span class="du-prompt">$</span> iphone-use upgrade            <span class="du-cmt"># 仅通知；签名安装需单独确认</span>
 <span class="du-prompt">$</span> iphone-use upgrade --check    <span class="du-cmt"># 什么都不改，只报告</span></code></pre>
       </div>
       <p>
-        <strong>自动升级</strong>默认开启，并且只在手机空闲时进行。每天 04:30 有一个任务检查新版本，只有没人在用那台手机时才升级：
-        没有 owner 租约、没有 hold、没有人在看实时画面，最近 15 分钟也没有 agent 请求。手机忙的话就等到第二天。
-        升级用的是该版本自己的 <code>install.sh</code>，带 SHA-256 校验和回滚，所有设置都会保留。
+        <strong>无人值守升级默认关闭。</strong> 旧的凌晨 04:30 安装任务已退役；版本检查不执行安装器、刷新 skill、重签 App 或构建 Runner。
+        手动安装必须来自已审查的固定版本本地构建，或经过独立信任根验证的完整签名离线包。
+        同源 SHA-256 不能替代发布者身份验证。
       </p>
       <div class="du-code">
         <div class="du-code-head">
@@ -187,7 +188,7 @@
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
           <span class="du-code-name">bash</span>
         </div>
-<pre><code><span class="du-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh -s -- --instance lab --udid &lt;UDID&gt;
+<pre><code><span class="du-prompt">$</span> bash install.sh ./iPhoneUse.app --no-setup --instance lab --udid &lt;UDID&gt;
 <span class="du-prompt">$</span> iphone-use setup --instance lab</code></pre>
       </div>
 
