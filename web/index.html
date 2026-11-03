@@ -1410,7 +1410,7 @@ const I18N_EN = {
   '正在恢复设备端控制服务，请稍候': 'Restoring the on-device control service, please wait',
   '设备画面暂时没有更新': 'The screen has not updated for a while',
   '新版本 ': 'New version ',
-  ' 可用(当前 v{version})— 升级:': ' is available (current v{version}). Upgrade: ',
+  ' 可用(当前 v{version})— 检查:': ' is available (current v{version}). Check: ',
   '会锁屏 · 需有人解锁': 'Will lock · needs a person to unlock',
   '会锁屏 · 可自动解锁': 'Will lock · can unlock itself',
   '会锁屏': 'Will lock',
@@ -2243,11 +2243,11 @@ function showOverlay(kind) {
       latest.textContent = String(s.latest);
       const command = document.createElement('code');
       command.textContent =
-        'curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh';
+        'iphone-use upgrade --check';
       updateText.replaceChildren(
         document.createTextNode(t('新版本 ')),
         latest,
-        document.createTextNode(t(' 可用(当前 v{version})— 升级:', { version: String(s.version || '—') })),
+        document.createTextNode(t(' 可用(当前 v{version})— 检查:', { version: String(s.version || '—') })),
         command,
       );
       document.getElementById('updateBanner').classList.add('visible');

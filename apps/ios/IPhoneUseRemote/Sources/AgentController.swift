@@ -65,7 +65,7 @@ final class AgentController: ObservableObject {
         let deviceID: UUID
         let goal: String
         let confirm: AgentConfirm
-        var id: String { "\(taskID)|\(confirm.action)|\(confirm.target ?? "")" }
+        var id: String { "\(taskID)|\(confirm.confirmationID ?? "legacy")|\(confirm.action)|\(confirm.target ?? "")" }
     }
 
     private let defaults: UserDefaults
@@ -318,7 +318,7 @@ final class AgentController: ObservableObject {
         answering = true
         defer { answering = false }
         do {
-            try await client.answer(task: prompt.taskID, approve: approve)
+            try await client.answer(task: prompt.taskID, approve: approve, confirmationID: prompt.confirm.confirmationID)
             answered.insert(prompt.id)
             if confirmPrompt == prompt { confirmPrompt = nil }
             UNUserNotificationCenter.current().removeDeliveredNotifications(

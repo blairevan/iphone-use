@@ -85,7 +85,7 @@
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
           <span class="du-code-name">bash</span>
         </div>
-<pre><code><span class="du-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code></pre>
+<pre><code><span class="du-prompt">$</span> bash install.sh ./iPhoneUse.app --no-setup</code></pre>
       </div>
 
       <h3>What the installer does</h3>
@@ -108,7 +108,7 @@
 <span class="du-prompt">$</span> iphone-use setup     <span class="du-cmt"># set the phone up again (after a new iPhone or Xcode)</span>
 <span class="du-prompt">$</span> iphone-use try       <span class="du-cmt"># a harmless check: open Settings, read the screen, go Home</span>
 <span class="du-prompt">$</span> iphone-use login     <span class="du-cmt"># sign a browser in again, with a QR code for the iPhone</span>
-<span class="du-prompt">$</span> iphone-use upgrade   <span class="du-cmt"># update everything</span>
+<span class="du-prompt">$</span> iphone-use upgrade   <span class="du-cmt"># notification only; never installs</span>
 <span class="du-prompt">$</span> ~/.iphone-use/uninstall.sh --dry-run   <span class="du-cmt"># what uninstalling would remove (drop --dry-run to do it)</span></code></pre>
       </div>
 
@@ -129,7 +129,7 @@
           <span class="du-code-name">prompt</span>
         </div>
 <pre><code>Install iphone-use (https://github.com/leeguooooo/iphone-use) on this Mac so you can drive my iPhone.
-1. Run: curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+1. Run: bash install.sh ./iPhoneUse.app --no-setup
 2. Run `iphone-use doctor`. Fix what it reports that can be fixed from the terminal, and run
    `iphone-use setup` when it tells you to.
 3. Some steps only I can do: signing in to an Apple ID in Xcode, tapping Trust on the iPhone,
@@ -161,19 +161,20 @@
       <hr class="du-divider" />
 
       <h2>Upgrades</h2>
+      <p>First installation: review a fixed source revision and build <code>iPhoneUse.app</code> locally before running the local installer below. Never pipe a floating download into a shell.</p>
       <div class="du-code">
         <div class="du-code-head">
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
           <span class="du-code-name">bash</span>
         </div>
-<pre><code><span class="du-prompt">$</span> iphone-use upgrade            <span class="du-cmt"># install the latest release (daemon + skill)</span>
+<pre><code><span class="du-prompt">$</span> iphone-use upgrade            <span class="du-cmt"># notification only; signed install is a separate confirmed action</span>
 <span class="du-prompt">$</span> iphone-use upgrade --check    <span class="du-cmt"># change nothing, just report</span></code></pre>
       </div>
       <p>
-        <strong>Automatic upgrades</strong> are on by default and wait for the phone to be idle. A daily job (04:30) upgrades every
-        daemon on the Mac when a newer release exists and nobody is using that phone: no owner lease, no hold, no live viewer and no
-        agent request in the last 15 minutes. A busy phone is skipped until the next day. The upgrade is the release's own
-        <code>install.sh</code>, with its SHA-256 checks and rollback, and every setting is carried over.
+        <strong>Unattended upgrades are disabled.</strong> The legacy 04:30 installer job is retired.
+        Version checks never execute installers, refresh skills, re-sign apps or rebuild runners.
+        Manual installation requires a reviewed fixed local build or a complete offline bundle verified
+        against an independently provisioned signing root. A same-source SHA-256 is not publisher authentication.
       </p>
       <div class="du-code">
         <div class="du-code-head">
@@ -191,7 +192,7 @@
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
           <span class="du-code-name">bash</span>
         </div>
-<pre><code><span class="du-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh -s -- --instance lab --udid &lt;UDID&gt;
+<pre><code><span class="du-prompt">$</span> bash install.sh ./iPhoneUse.app --no-setup --instance lab --udid &lt;UDID&gt;
 <span class="du-prompt">$</span> iphone-use setup --instance lab</code></pre>
       </div>
 

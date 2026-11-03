@@ -369,6 +369,7 @@ fn append_log_line(line: String) {
 }
 
 fn append_to(path: &std::path::Path, line: &str) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let Ok(_guard) = LOG_LOCK.lock() else {
         return;
     };
@@ -380,25 +381,28 @@ fn append_to(path: &std::path::Path, line: &str) {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path);
     if let Ok(mut file) = file {
+        let Ok(metadata) = file.metadata() else { return; };
+        // SAFETY: geteuid has no pointer arguments or side effects.
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() } {
+            return;
+        }
+        if file.set_permissions(std::fs::Permissions::from_mode(0o600)).is_err() { return; }
         let _ = writeln!(file, "{line}");
     }
 }
 
-/// The caller's lease name, if it sent one: short, printable, nothing else.
+/// A per-process pseudonym for the caller's lease name, never the raw label.
 fn owner_of(request: &Request) -> String {
     request
         .headers()
         .get("x-phone-owner")
         .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.chars()
-                .filter(|c| c.is_ascii_graphic())
-                .take(64)
-                .collect::<String>()
-        })
         .filter(|v| !v.is_empty())
+        .map(crate::security::log_identifier)
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -410,14 +414,20 @@ fn query_keys(request: &Request) -> Vec<String> {
         .unwrap_or("")
         .split('&')
         .filter_map(|pair| pair.split('=').next())
-        .filter(|key| !key.is_empty())
-        .map(|key| key.chars().take(32).collect())
+        .filter(|key| matches!(*key, "since" | "filter" | "limit" | "scope" | "image" | "mode" | "return" | "owner" | "format" | "max_side"))
+        .map(str::to_string)
         .collect()
 }
 
 /// axum middleware: time `/agent/*` requests and attach the breakdown.
 pub async fn layer(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
+    // The router's static pattern cannot contain a credential placed in a URL.
+    let logged_path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| "/agent/unknown".into());
     if !path.starts_with("/agent/") || is_stream(&path) {
         return next.run(request).await;
     }
@@ -483,15 +493,14 @@ pub async fn layer(request: Request, next: Next) -> Response {
                 .unwrap_or(0),
             "owner": owner,
             "method": method,
-            "path": path,
+            "path": logged_path,
             "query": query,
             "status": response.status().as_u16(),
-            "timing": summary.json(),
+            "timing": {"total_ms": summary.total_ms, "runner_ms": summary.runner_ms,
+                "calls": summary.calls, "cancelled": summary.cancelled},
         });
         let mut line = line;
-        if !recorder.notes.is_empty() {
-            line["notes"] = serde_json::Value::Object(recorder.notes.clone());
-        }
+        line["note_count"] = serde_json::json!(recorder.notes.len());
         let line = line.to_string();
         tokio::task::spawn_blocking(move || append_log_line(line));
     }
@@ -1035,13 +1044,17 @@ mod tests {
     }
 
     #[test]
-    fn log_lines_name_the_owner_and_query_keys_but_never_values() {
+    fn log_lines_pseudonymize_owners_and_allowlist_query_names() {
         let request = Request::builder()
             .uri("/agent/elements?since=SECRETTOKEN&filter=hello")
             .header("x-phone-owner", "paypay-check")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(owner_of(&request), "paypay-check");
+        assert_eq!(
+            owner_of(&request),
+            crate::security::log_identifier("paypay-check")
+        );
+        assert!(!owner_of(&request).contains("paypay-check"));
         assert_eq!(query_keys(&request), vec!["since", "filter"]);
         let anonymous = Request::builder()
             .uri("/agent/elements")
@@ -1049,6 +1062,11 @@ mod tests {
             .unwrap();
         assert_eq!(owner_of(&anonymous), "-");
         assert!(query_keys(&anonymous).is_empty());
+        let private_key = Request::builder()
+            .uri("/agent/elements?fixture-secret=1")
+            .body(Body::empty())
+            .unwrap();
+        assert!(query_keys(&private_key).is_empty());
     }
 
     #[test]

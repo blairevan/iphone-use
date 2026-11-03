@@ -40,21 +40,32 @@ struct Identity {
 
 /// Where requests reach this daemon through `relay`: `<relay>/p/<id>`.
 pub fn public_url(relay: &str, state_dir: &Path) -> Option<String> {
+    let relay = crate::security::relay_base(relay).ok()?;
     let identity = load_identity(state_dir).ok()?;
-    Some(format!("{}/p/{}", relay.trim_end_matches('/'), identity.id))
+    Some(format!(
+        "{}/p/{}",
+        relay.as_str().trim_end_matches('/'),
+        identity.id
+    ))
 }
 
 /// Keep the tunnel to the relay that `relay_url` names open for as long as the
 /// process runs. `relay_url` is asked again before each attempt, so a relay
 /// configured later is picked up.
-pub fn spawn(relay_url: impl Fn() -> Option<String> + Send + 'static, state_dir: PathBuf, port: u16) {
+pub fn spawn(
+    relay_url: impl Fn() -> Option<String> + Send + 'static,
+    state_dir: PathBuf,
+    port: u16,
+    ingress: String,
+    public: Option<String>,
+) {
     tokio::spawn(async move {
         let mut backoff = 1u64;
         loop {
             if let Some(relay) = relay_url() {
-                match run(&relay, &state_dir, port).await {
+                match run(&relay, &state_dir, port, &ingress, public.as_deref()).await {
                     Ok(()) => backoff = 1,
-                    Err(error) => tracing::warn!("relay tunnel: {error}"),
+                    Err(_) => tracing::warn!("relay tunnel failed; reconnecting without logging remote response content"),
                 }
             }
             tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -68,10 +79,13 @@ fn identity_path(state_dir: &Path) -> PathBuf {
 }
 
 fn load_identity(state_dir: &Path) -> Result<Identity, String> {
+    use std::io::Write;
     let path = identity_path(state_dir);
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(identity) = serde_json::from_str::<Identity>(&text) {
-            return Ok(identity);
+    match read_identity(&path) {
+        Ok(identity) => return Ok(identity),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err("relay identity is unreadable or insecure; refusing to replace it".into())
         }
     }
     let mut id = [0u8; 16];
@@ -79,20 +93,82 @@ fn load_identity(state_dir: &Path) -> Result<Identity, String> {
     getrandom::fill(&mut id).map_err(|e| e.to_string())?;
     getrandom::fill(&mut key).map_err(|e| e.to_string())?;
     let identity = Identity { id: URL_SAFE_NO_PAD.encode(id), key: URL_SAFE_NO_PAD.encode(key) };
-    std::fs::write(&path, serde_json::to_string(&identity).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    // A NamedTempFile is private from creation. Persist without replacing a
+    // concurrently created identity, and never follow a symlink at the target.
+    let mut staged = tempfile::NamedTempFile::new_in(state_dir)
+        .map_err(|_| "could not create private relay identity staging file")?;
+    let bytes = serde_json::to_vec(&identity).map_err(|_| "could not serialize relay identity")?;
+    staged
+        .write_all(&bytes)
+        .and_then(|_| staged.as_file().sync_all())
+        .map_err(|_| "could not persist relay identity")?;
+    match staged.persist_noclobber(&path) {
+        Ok(_) => Ok(identity),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_identity(&path)
+                .map_err(|_| "concurrent relay identity is insecure or invalid".into())
+        }
+        Err(_) => Err("could not install relay identity without replacement".into()),
+    }
+}
+
+/// Open private key material without following symlinks. Never silently mint a
+/// new identity for a corrupt file: that would defeat pairing and revocation.
+fn read_identity(path: &Path) -> std::io::Result<Identity> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid relay identity");
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(invalid());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid reads process identity and has no pointer arguments.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(invalid());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes)?;
+    let identity: Identity = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if URL_SAFE_NO_PAD
+        .decode(&identity.id)
+        .ok()
+        .is_none_or(|b| b.len() != 16)
+        || URL_SAFE_NO_PAD
+            .decode(&identity.key)
+            .ok()
+            .is_none_or(|b| b.len() != 32)
+    {
+        return Err(invalid());
     }
     Ok(identity)
 }
 
 /// One tunnel session, until the relay or the network drops it.
-async fn run(relay: &str, state_dir: &Path, port: u16) -> Result<(), String> {
+async fn run(
+    relay: &str,
+    state_dir: &Path,
+    port: u16,
+    ingress: &str,
+    public: Option<&str>,
+) -> Result<(), String> {
+    let relay_base = crate::security::relay_base(relay)?;
+    let ingress_base = public
+        .map(crate::security::relay_base)
+        .transpose()?
+        .unwrap_or_else(|| relay_base.clone());
     let identity = load_identity(state_dir)?;
-    let url = format!("{}/t/{}", relay.trim_end_matches('/'), identity.id)
+    let url = format!("{}/t/{}", relay_base.as_str().trim_end_matches('/'), identity.id)
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
     let mut request = url.as_str().into_client_request().map_err(|e| e.to_string())?;
@@ -108,6 +184,9 @@ async fn run(relay: &str, state_dir: &Path, port: u16) -> Result<(), String> {
         .await
         .map_err(|e| format!("connect {host}: {e}"))?;
     let _ = tcp.set_nodelay(true);
+    let limits = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(2 * 1024 * 1024))
+        .max_frame_size(Some(2 * 1024 * 1024));
     let (socket, _) = if tls {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -121,16 +200,16 @@ async fn run(relay: &str, state_dir: &Path, port: u16) -> Result<(), String> {
             .connect(name, tcp)
             .await
             .map_err(|e| format!("tls {host}: {e}"))?;
-        let (ws, response) = tokio_tungstenite::client_async(request, Box::new(stream) as Box<dyn Io>)
+        let (ws, response) = tokio_tungstenite::client_async_with_config(request, Box::new(stream) as Box<dyn Io>, Some(limits))
             .await
             .map_err(|e| format!("handshake: {e}"))?;
         (ws, response)
     } else {
-        tokio_tungstenite::client_async(request, Box::new(tcp) as Box<dyn Io>)
+        tokio_tungstenite::client_async_with_config(request, Box::new(tcp) as Box<dyn Io>, Some(limits))
             .await
             .map_err(|e| format!("handshake: {e}"))?
     };
-    tracing::info!("relay tunnel open: {}/p/{}", relay.trim_end_matches('/'), identity.id);
+    tracing::info!("authenticated relay tunnel open");
 
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
@@ -171,17 +250,30 @@ async fn run(relay: &str, state_dir: &Path, port: u16) -> Result<(), String> {
             continue;
         }
         let Ok(frame) = serde_json::from_str::<serde_json::Value>(text.as_str()) else { continue };
-        let Some(id) = frame["id"].as_u64().map(|id| id as u32) else { continue };
+        if text.len() > 2 * 1024 * 1024 {
+            break Err("relay frame exceeds limit".into());
+        }
+        let Some(id) = frame["id"].as_u64().and_then(|id| u32::try_from(id).ok()) else {
+            continue;
+        };
         tasks.retain(|_, (task, _)| !task.is_finished());
         match frame["t"].as_str() {
             Some("req") => {
+                if tasks.len() >= 32 || tasks.contains_key(&id) {
+                    break Err("relay concurrent request limit or duplicate request id".into());
+                }
                 let window = Arc::new(tokio::sync::Semaphore::new(WINDOW));
-                let task = tokio::spawn(serve(client.clone(), port, id, frame, out_tx.clone(), window.clone()));
+                let authority = match ingress_base.port() {
+                    Some(port) => format!("{}:{port}", ingress_base.host_str().unwrap_or("")),
+                    None => ingress_base.host_str().unwrap_or("").to_string(),
+                };
+                let task = tokio::spawn(serve(client.clone(), port, id, frame, out_tx.clone(), window.clone(), TrustedIngress { authority, token: ingress.to_string() }));
                 tasks.insert(id, (task, window));
             }
             Some("ack") => {
                 if let (Some((_, window)), Some(n)) = (tasks.get(&id), frame["n"].as_u64()) {
-                    window.add_permits(n as usize);
+                    if n > WINDOW as u64 { break Err("invalid relay acknowledgement".into()); }
+                    window.add_permits((n as usize).min(WINDOW.saturating_sub(window.available_permits())));
                 }
             }
             Some("cancel") => {
@@ -203,6 +295,13 @@ async fn run(relay: &str, state_dir: &Path, port: u16) -> Result<(), String> {
 trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
+/// The configured relay's authority and the private local replay capability
+/// travel together; neither comes from a client's forwarded headers.
+struct TrustedIngress {
+    authority: String,
+    token: String,
+}
+
 /// Replay one relayed request on loopback and stream the answer back.
 async fn serve(
     client: reqwest::Client,
@@ -211,6 +310,7 @@ async fn serve(
     frame: serde_json::Value,
     out: mpsc::Sender<Message>,
     window: Arc<tokio::sync::Semaphore>,
+    ingress: TrustedIngress,
 ) {
     let method = frame["m"].as_str().unwrap_or("GET");
     let path = frame["p"].as_str().unwrap_or("/");
@@ -218,7 +318,13 @@ async fn serve(
         Message::Text(serde_json::json!({ "t": "res", "id": id, "s": status, "h": headers }).to_string().into())
     };
     let end = || Message::Text(serde_json::json!({ "t": "end", "id": id }).to_string().into());
-    if !path.starts_with('/') {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('\\')
+        || path.len() > 8192
+        || frame["h"].as_array().is_some_and(|h| h.len() > 64)
+        || frame["b"].as_str().is_some_and(|b| b.len() > 1_400_000)
+    {
         let _ = out.send(reply(400, Vec::new())).await;
         let _ = out.send(end()).await;
         return;
@@ -227,8 +333,22 @@ async fn serve(
     let mut request = client.request(method, format!("http://127.0.0.1:{port}{path}"));
     for pair in frame["h"].as_array().into_iter().flatten() {
         if let (Some(name), Some(value)) = (pair[0].as_str(), pair[1].as_str()) {
-            request = request.header(name, value);
+            let name = name.to_ascii_lowercase();
+            if !matches!(name.as_str(), "host" | "connection" | "content-length" | "transfer-encoding" | "forwarded" | "x-forwarded-host" | "x-forwarded-proto" | "x-real-ip")
+                && !name.starts_with("x-iphone-use-") {
+                request = request.header(name, value);
+            }
         }
+    }
+    request = request
+        .header("host", &ingress.authority)
+        .header("x-forwarded-proto", "https")
+        .header("x-iphone-use-relay-ingress", ingress.token);
+    if let Some(source) = frame["source"]
+        .as_str()
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+    {
+        request = request.header("x-real-ip", source.to_string());
     }
     if let Some(body) = frame["b"].as_str().filter(|b| !b.is_empty()) {
         request = request.body(STANDARD.decode(body).unwrap_or_default());
@@ -355,5 +475,32 @@ mod tests {
             format!("https://relay.example/p/{}", first.id)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_identity_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = identity_path(dir.path());
+        std::fs::write(&path, b"broken identity").unwrap();
+        assert!(load_identity(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"broken identity");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_is_private_and_symlinks_are_rejected() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        load_identity(dir.path()).unwrap();
+        let path = identity_path(dir.path());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_identity(dir.path()).is_err());
+        let other = tempfile::tempdir().unwrap();
+        symlink(&path, identity_path(other.path())).unwrap();
+        assert!(load_identity(other.path()).is_err());
     }
 }

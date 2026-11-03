@@ -955,6 +955,20 @@ pub struct SummaryLog {
     rotate_bytes: u64,
 }
 
+/// Persistent analytics retain counters, not caller-selected owner/run text.
+/// The in-memory API keeps its normal identities for authorization and queries.
+fn log_safe_summary(summary: &RunSummary) -> RunSummary {
+    let mut logged = summary.clone();
+    match &mut logged.key {
+        RunKey::Explicit { owner, run_id, .. } => {
+            *owner = crate::security::log_identifier(owner);
+            *run_id = crate::security::log_identifier(run_id);
+        }
+        RunKey::Inferred { owner, .. } => *owner = crate::security::log_identifier(owner),
+    }
+    logged
+}
+
 impl SummaryLog {
     pub fn new(path: PathBuf, rotate_bytes: u64) -> Self {
         Self { path, rotate_bytes }
@@ -967,7 +981,8 @@ impl SummaryLog {
                 "live run summaries cannot be persisted as closed runs",
             ));
         }
-        let mut line = serde_json::to_string(summary).map_err(std::io::Error::other)?;
+        let mut line =
+            serde_json::to_string(&log_safe_summary(summary)).map_err(std::io::Error::other)?;
         line.push('\n');
         let parent = self
             .path
@@ -1513,7 +1528,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.ends_with('\n') && text.lines().count() == 1);
         let back: RunSummary = serde_json::from_str(text.trim_end()).unwrap();
-        assert_eq!(back, summary());
+        assert_eq!(back, log_safe_summary(&summary()));
     }
 
     #[test]
@@ -1541,7 +1556,10 @@ mod tests {
     fn concurrent_writers_lose_nothing_across_rotations() {
         let dir = private_dir();
         let path = dir.path().join("agent-runs.jsonl");
-        let line = serde_json::to_string(&summary()).unwrap().len() as u64 + 1;
+        let line = serde_json::to_string(&log_safe_summary(&summary()))
+            .unwrap()
+            .len() as u64
+            + 1;
         // Rotate after every 3 lines, with 6 writers racing.
         let threads: Vec<_> = (0..6)
             .map(|_| {
@@ -1575,7 +1593,9 @@ mod tests {
     fn concurrent_writers_never_interleave_lines() {
         let dir = private_dir();
         let path = dir.path().join("agent-runs.jsonl");
-        let line_len = serde_json::to_string(&summary()).unwrap().len();
+        let line_len = serde_json::to_string(&log_safe_summary(&summary()))
+            .unwrap()
+            .len();
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let path = path.clone();

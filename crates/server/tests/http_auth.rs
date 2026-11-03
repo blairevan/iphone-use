@@ -671,7 +671,7 @@ fn agent_status_reports_freshness_only_for_the_requested_mjpeg_stream() {
 }
 
 #[test]
-fn token_only_config_keeps_the_open_browser_ui_usable() {
+fn token_only_config_never_exposes_anonymous_browser_apis() {
     block(async {
         let app = http::router(build_state_with_agent_token(None, Some("agent-secret")));
 
@@ -685,7 +685,7 @@ fn token_only_config_keeps_the_open_browser_ui_usable() {
             )
             .await
             .unwrap();
-        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
 
         let screenshot = app
             .clone()
@@ -697,7 +697,7 @@ fn token_only_config_keeps_the_open_browser_ui_usable() {
             )
             .await
             .unwrap();
-        assert_eq!(screenshot.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(screenshot.status(), StatusCode::UNAUTHORIZED);
 
         let mjpeg = app
             .oneshot(
@@ -708,7 +708,7 @@ fn token_only_config_keeps_the_open_browser_ui_usable() {
             )
             .await
             .unwrap();
-        assert_eq!(mjpeg.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mjpeg.status(), StatusCode::UNAUTHORIZED);
     });
 }
 
@@ -2789,11 +2789,10 @@ fn agent_bearer_failures_trigger_lockout() {
 }
 
 #[test]
-fn login_failures_lock_out_agent_endpoints_via_shared_counter() {
+fn login_failures_cannot_lock_out_valid_agent_credentials() {
     block(async {
-        // The limiter is one shared counter across the cookie login AND the agent
-        // bearer paths — 5 wrong /login attempts must 429 a subsequent agent call
-        // even though the agent itself never failed.
+        // Anonymous password guesses must not revoke a legitimate machine's
+        // independent authentication domain.
         let state = build_state(Some("hunter2"));
         let app = http::router(state);
 
@@ -2813,7 +2812,7 @@ fn login_failures_lock_out_agent_endpoints_via_shared_counter() {
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         }
 
-        // Agent request with the CORRECT bearer is still rejected while locked.
+        // Correct bearer remains usable while the login failure bucket is full.
         let resp = app
             .oneshot(
                 Request::builder()
@@ -2826,8 +2825,8 @@ fn login_failures_lock_out_agent_endpoints_via_shared_counter() {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "shared lockout must cover the agent path too"
+            StatusCode::OK,
+            "valid machine credentials must not share anonymous login lockout"
         );
     });
 }

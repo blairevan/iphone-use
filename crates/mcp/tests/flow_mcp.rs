@@ -233,7 +233,7 @@ fn phone_flow_run_hands_an_agent_the_structured_failure_and_its_diagnosis() {
         "tools/call",
         serde_json::json!({
             "name": "phone_flow_run",
-            "arguments": {"id": "test/search", "force": true}
+            "arguments": {"id": "test/search", "force": true, "confirm": true}
         }),
     );
 
@@ -305,7 +305,7 @@ fn a_lost_answer_reaches_the_agent_as_unknown_and_not_retry_safe() {
         "tools/call",
         serde_json::json!({
             "name": "phone_flow_run",
-            "arguments": {"id": "test/search", "force": true}
+            "arguments": {"id": "test/search", "force": true, "confirm": true}
         }),
     );
 
@@ -356,7 +356,7 @@ fn a_body_without_a_verdict_reaches_the_agent_as_unknown() {
         "tools/call",
         serde_json::json!({
             "name": "phone_flow_run",
-            "arguments": {"id": "test/search", "force": true}
+            "arguments": {"id": "test/search", "force": true, "confirm": true}
         }),
     );
 

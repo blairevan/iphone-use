@@ -20,12 +20,20 @@
 #[allow(dead_code)]
 fn fixture_app_state(password: Option<&str>) -> Arc<AppState> {
     Arc::new(AppState {
+        credentials: Mutex::new(srv::credentials::Store::default()),
         password: password.map(|s| s.to_string()),
         secret: b"test-secret-key-0123456789abcdef".to_vec(),
         session_ttl_secs: 3600,
         cookie_secure: false,
         base_path: String::new(),
+        public_url: None,
+        allowed_hosts: Vec::new(),
+        trusted_proxy_ips: Vec::new(),
+        login_admission: Mutex::new(srv::browser_boundary::LoginAdmission::default()),
+        admin_admission: Mutex::new(srv::browser_boundary::LoginAdmission::default()),
         auth_limiter: Arc::new(Mutex::new(srv::http::AuthLimiter::new())),
+        login_limiter: Arc::new(Mutex::new(srv::http::AuthLimiter::new())),
+        pair_limiter: Arc::new(Mutex::new(srv::http::AuthLimiter::new())),
         agent_token: None,
         device_udid: None,
         simulator: None,

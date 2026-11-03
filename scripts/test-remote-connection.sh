@@ -21,7 +21,10 @@ keychain = device[device.index('enum Keychain {'):]
 for name in ['CopyMatching', 'Update', 'Add', 'Delete']:
     keychain = keychain.replace('SecItem'+name+'(', 'FixtureSecItem'+name+'(')
 start = device.index('    @discardableResult\n    static func moveCredentials')
-move = device[start:device.index('    static func savePassword', start)]
+# Extract only the static helper. Other instance methods may be added between
+# it and savePassword and must not accidentally become fixture enum members.
+end = device.index('\n    }\n', start) + len('\n    }\n')
+move = device[start:end]
 move = move.replace('UserDefaults.standard', 'ConnectionCheckDefaults')
 helpers = '''
 enum CredentialMover {

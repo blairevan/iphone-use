@@ -25,14 +25,9 @@ pub const API_LATEST_URL: &str =
 /// `/tag/vX.Y.Z`. No anonymous rate limit (the API allows 60 requests an hour
 /// per IP), so it is the fallback when the API refuses.
 pub const WEB_LATEST_URL: &str = "https://github.com/leeguooooo/iphone-use/releases/latest";
-/// The installer `upgrade` downloads and runs (the same script as
-/// [`INSTALL_COMMAND`], fetched first so a failed download is an error).
-pub const INSTALL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh";
-/// The documented install/upgrade route. It installs the daemon app and the
-/// release-matched skill together.
+/// Safe guidance until independently trusted, signed release manifests exist.
 pub const INSTALL_COMMAND: &str =
-    "curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh";
+    "Review a fixed release and its installer locally; remote installer execution is disabled. Check versions with: iphone-use upgrade --check";
 pub const PLUGIN_ID: &str = "iphone-use@leeguooooo-plugins";
 /// A copied skill (not the installer's, not a plugin or checkout) is not
 /// release-matched, and a floating public install is not a supported way to
@@ -688,7 +683,8 @@ impl UpgradeReport {
 // Automatic upgrades (scripts/auto-update.sh)
 // ---------------------------------------------------------------------------
 
-/// The daily auto-update job's label; install.sh turns it on by default.
+/// The legacy daily job's label. New installs disable it; explicitly enabling
+/// the updated script schedules notification-only checks, never installations.
 pub const AUTO_UPDATE_LABEL: &str = "com.leeguoo.iphone-use.autoupdate";
 
 /// One instance in the job's last upgrade (`~/.iphone-use/auto-update-last.json`).
@@ -754,7 +750,7 @@ impl AutoUpdateState {
             })
             .collect();
         Some(format!(
-            "the automatic upgrade to {} failed ({}); run: iphone-use upgrade",
+            "the previous automatic upgrade to {} failed ({}); check: iphone-use upgrade --check",
             display_version(&last.latest),
             failed.join("; ")
         ))
@@ -766,9 +762,9 @@ impl AutoUpdateState {
             return failure;
         }
         let state = if self.enabled {
-            "on (daily, when the phone is idle; off: ~/.iphone-use/auto-update.sh disable)"
+            "legacy job registered; current script checks only (disable: ~/.iphone-use/auto-update.sh disable)"
         } else {
-            "off (on: ~/.iphone-use/auto-update.sh enable)"
+            "off; version notices do not install updates"
         };
         match &self.last {
             Some(last) => format!(

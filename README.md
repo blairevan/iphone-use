@@ -25,8 +25,10 @@ Claude Code, Codex or any MCP client reads the screen as text, taps, types and s
 
 <p align="center"><strong>Website and docs: <a href="https://iphone-use.leeguoo.com/en/">iphone-use.leeguoo.com</a></strong></p>
 
+**Hardened build: unattended upgrades are off, and downloaded installers are not executed.** For a first installation, review a fixed source revision, build it locally and package `iPhoneUse.app` with `scripts/make-app.sh`, then run the command below. An existing verifier can install an [independently trusted signed offline bundle](docs/security/signed-releases.md). A checksum from the download site is not publisher authentication. Remote access is off until [explicit HTTPS configuration](docs/security/remote-access.md).
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+bash install.sh ./iPhoneUse.app --no-setup
 ```
 
 https://github.com/user-attachments/assets/ee298774-bf3e-4fd0-9a08-481b20904f61
@@ -115,7 +117,7 @@ iphone-use doctor    # what is missing, and how to fix it
 iphone-use setup     # set the phone up again (after a new iPhone or Xcode)
 iphone-use try       # a harmless check: open Settings, read the screen, go Home
 iphone-use login     # sign a browser in again, with a QR code for the iPhone
-iphone-use upgrade   # update everything
+iphone-use upgrade --check   # version notice only; never installs
 ~/.iphone-use/uninstall.sh --dry-run   # what uninstalling would remove (drop --dry-run to do it)
 ```
 
@@ -125,7 +127,7 @@ Paste this into Codex or Claude Code on the Mac the iPhone is plugged into:
 
 ```text
 Install iphone-use (https://github.com/leeguooooo/iphone-use) on this Mac so you can drive my iPhone.
-1. Run: curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+1. Review a fixed source revision and build locally, or verify a signed offline bundle using an independently provisioned trust root; never execute a downloaded script directly. For the reviewed local build, run: bash install.sh ./iPhoneUse.app --no-setup
 2. Run `iphone-use doctor`. Fix what it reports that can be fixed from the terminal, and run
    `iphone-use setup` when it tells you to.
 3. Some steps only I can do: signing in to an Apple ID in Xcode, tapping Trust on the iPhone,
@@ -310,7 +312,7 @@ iphone-use focuses on a real device runner, explicit action outcomes and determi
 ## The `*-use` family
 
 Small, composable CLIs that give an AI agent hands on one real thing. Same shape
-everywhere: `curl … install.sh | sh` to install, JSON on stdout, and a companion
+everywhere: an explicitly reviewed local installer to install, JSON on stdout, and a companion
 skill that teaches your agent to drive it — each repo's own README says how to
 install its skill, since the right way differs per project and per release.
 

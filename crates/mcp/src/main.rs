@@ -166,6 +166,13 @@ enum JevCommand {
 
 #[derive(Debug, Subcommand)]
 enum FlowCommand {
+    /// Persist local approval for reviewed low-risk bytes and these exact inputs.
+    /// Run only after inspecting the flow; registry changes invalidate approval.
+    Approve {
+        target: String,
+        #[arg(long = "input", value_name = "KEY=VALUE")]
+        inputs: Vec<String>,
+    },
     /// Validate a flow file or installed registry flow offline (no daemon, no phone).
     Validate {
         /// JSON flow file, or a registry id such as `health/export-all`.
@@ -187,7 +194,8 @@ enum FlowCommand {
         /// Ephemeral flow input in KEY=VALUE form. Repeat for multiple inputs.
         #[arg(long = "input")]
         inputs: Vec<String>,
-        /// Required for side_effect flows.
+        /// Approve this exact invocation when no matching local review exists.
+        /// Unknown-risk and side_effect flows always need per-run confirmation.
         #[arg(long)]
         confirm: bool,
         /// Run even when compat is broken/incompatible.
@@ -205,7 +213,8 @@ enum FlowCommand {
         /// Values are used for this run only and are never written to the flow.
         #[arg(long = "input", value_name = "KEY=VALUE")]
         inputs: Vec<String>,
-        /// Required for flows declared `risk: side_effect` (send/publish/pay/delete).
+        /// Approve this exact invocation when no matching local review exists.
+        /// Unknown-risk and side_effect flows always need per-run confirmation.
         #[arg(long)]
         confirm: bool,
         /// Run even when compat is broken/incompatible for the installed app version.
@@ -311,7 +320,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-
     // Log to stderr so it does not interfere with the MCP stdio protocol on
     // stdout/stdin.  MCP clients typically capture stderr for diagnostics.
     tracing_subscriber::registry()
@@ -319,7 +327,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(tracing_subscriber::fmt::layer().event_format(iphone_use_mcp::safe_log::PrivacyFormatter).with_writer(std::io::stderr))
         .init();
 
     if let Some(Command::Jev { command: JevCommand::Run { goal, app, max_steps } }) = &cli.command {
@@ -373,6 +381,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     if let Some(Command::Flow { command }) = cli.command {
         return match command {
+            FlowCommand::Approve { target, inputs } => {
+                let digest = iphone_use_mcp::flow_policy::approve(&target, &inputs)?;
+                println!("Approved this exact local invocation: {digest}. Changed bytes or inputs require a new review.");
+                Ok(())
+            }
             FlowCommand::Validate { target } => flow::validate_command(&target),
             FlowCommand::Draft { out } => {
                 let response = client::DaemonClient::from_env().flow_draft().await?;

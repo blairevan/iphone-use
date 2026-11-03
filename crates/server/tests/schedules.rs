@@ -335,18 +335,24 @@ fn the_api_validates_with_iphone_use_mcp_and_refuses_unconfirmed_side_effects() 
     assert_eq!(status, 404);
 }
 
-/// The phone's own daemon cannot start iphone-use-mcp: a due flow runs in
-/// process, against the daemon, as the run's owner, and hands the phone back.
+/// The phone's in-process scheduler enforces the same local approval policy
+/// as the CLI. A downloaded navigation label never authorizes execution.
 #[test]
-fn on_the_phone_a_due_flow_runs_in_process_as_its_own_owner() {
+fn on_the_phone_an_unapproved_due_flow_is_refused_and_releases_its_owner() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = fake_daemon();
     *daemon.status.lock().unwrap() =
         r#"{"drivable":true,"owner":null,"backend":"direct"}"#.to_string();
-    let flow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/flows/open-spotlight.json")
-        .canonicalize()
-        .unwrap();
+    let flow = dir.path().join("unreviewed.json");
+    std::fs::write(
+        &flow,
+        serde_json::json!({
+            "version":1,"name":format!("Unreviewed {}",dir.path().display()),
+            "risk":"navigation","steps":[{"kind":"shortcut","name":"home"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("schedules.json"),
         serde_json::json!({
@@ -378,15 +384,24 @@ fn on_the_phone_a_due_flow_runs_in_process_as_its_own_owner() {
     );
     block(s.tick());
     let run = last_run(&s);
-    assert_ne!(run["state"], "due", "{run}");
+    assert_eq!(run["state"], "failed", "{run}");
+    assert!(
+        run["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("local approval"),
+        "{run}"
+    );
     assert!(
         run["error"].as_str().map_or(true, |e| !e.contains("iphone-use-mcp")),
         "never reaches for the binary: {run}"
     );
     let seen = daemon.seen.lock().unwrap().join("\n");
     assert!(
-        seen.lines().any(|l| l.starts_with("POST /agent/") && !l.starts_with("POST /agent/owner") && l.ends_with("owner=schedule-s1")),
-        "the flow drove the daemon as the run's owner: {seen}\n{run}"
+        !seen
+            .lines()
+            .any(|l| l.starts_with("POST /agent/") && !l.starts_with("POST /agent/owner")),
+        "unreviewed scheduled content must not drive the phone: {seen}\n{run}"
     );
     assert!(
         seen.contains("POST /agent/owner HTTP/1.1 owner=schedule-s1"),

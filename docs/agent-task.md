@@ -6,7 +6,7 @@ by itself, step by step, and reports on. Three ways to use it, one API:
 | Who asks | Where the daemon runs | Address |
 |---|---|---|
 | The iPhone app, for the phone it runs on | inside the device runner on that phone | `http://127.0.0.1:8787` |
-| Any agent or the web page on a Mac | the Mac (`iphone-use serve`) | `http://<mac>:8787` |
+| Any agent or the web page on a Mac | the Mac (`iphone-use serve`) | loopback on that Mac, or its configured HTTPS entry point |
 | The iPhone app, for another phone | that phone's runner, or the Mac that drives it | its paired address |
 
 The daemon on the phone is the same program as on the Mac (`crates/ios-embed` links it into the
@@ -18,6 +18,11 @@ while another app is in front, so a task keeps going after the app that started 
 All need the agent credential (`Authorization: Bearer <token>`, or the session cookie). Writes also
 need `X-Phone-Control: 1`; a task holds the phone's owner lease as `task-<id>` while it runs, so
 other callers get `409 phone_owned` instead of fighting it.
+
+Task ownership is separate from the display-only owner lease. The server derives a principal
+from a verified bearer or session; JSON `principal` / `owner` fields cannot grant task access.
+Task reads, history and mutations are restricted to that principal. A renewed paired-device
+session keeps its signed subject. Clients sharing a legacy bearer token share one identity. `/security` can issue separate read/control agent credentials and revoke a device, session or agent. Revocation is persisted, closes protected response streams and cancels that principal’s tasks.
 
 ### `POST /agent/task`
 
@@ -54,7 +59,7 @@ screen. Callers supplying `app` keep its current screen unless `app_fresh` is tr
     {"n": 1, "action": "CLICK", "target": "电池", "text": null, "app": "设置",
      "ok": true, "error": null, "page_changed": true, "by": "jev | assist | flow", "ms": 640}
   ],
-  "confirm": {"action": "CLICK", "target": "确认支付", "reason": "pays ¥55.51", "app": "拼多多"} | null,
+  "confirm": {"action": "CLICK", "target": "确认支付", "reason": "pays ¥55.51", "app": "拼多多", "confirmation_id": "opaque-prompt-revision"} | null,
   "summary": "电池电量 87%，低电量模式关闭。",   // plain words for the person, when finished
   "error": null,
   "started_at_ms": 0, "elapsed_ms": 0,
@@ -64,7 +69,12 @@ screen. Callers supplying `app` keep its current screen unless `app_fresh` is tr
 
 `?since=<n>` returns only steps after step `n` (the app polls about once a second).
 
-### `POST /agent/task/<id>/confirm` `{"approve": true | false}`
+### `POST /agent/task/<id>/confirm`
+
+Send `{"approve": true, "confirmation_id": "<revision from the displayed prompt>"}`
+(or `approve: false`). Missing revisions are rejected; a stale revision returns
+`409 stale_confirmation` without consuming the current prompt. Do not fetch a newer revision
+when sending an answer to an older displayed prompt.
 
 Answers a `needs_confirm`. Approve runs exactly the step shown, once; decline ends the task as
 `blocked`. A task waiting longer than 5 minutes ends as `blocked`.
@@ -75,7 +85,15 @@ Stops after the current step; `status: cancelled`.
 
 ### `GET /agent/tasks`
 
-The last 20 tasks, newest first, without `steps`.
+The caller's tasks among the retained history (up to 20), newest first, without `steps`.
+
+### `POST /agent/task/<id>/takeover`
+
+An authenticated caller may explicitly take ownership with fresh administrator password
+verification and a nonempty reason: `{"admin_password":"<password>","reason":"<reason>"}`.
+The server records the task, new principal and a reason digest, not the password or reason
+text. Takeover does not approve a pending action; the new owner must review the current
+prompt and answer with its `confirmation_id`.
 
 ## How a task runs
 
@@ -156,6 +174,17 @@ container) next to the registry's; tasks and schedules on that daemon find both.
   "myapp/daily-check", "inputs": {}, "confirm_side_effects": false, "name": "…"}`),
   `DELETE/PATCH /agent/schedules/<id>`, `POST /agent/schedules/<id>/run` (run now),
   `GET /agent/schedules/<id>/runs`, `GET /agent/schedules/runs`. On the phone the daemon runs them
-  in process; a flow that sends, pays or deletes needs `confirm_side_effects: true`.
+  in process. Scheduled execution requires a separate local approval bound to the exact low-risk flow bytes and inputs. `confirm_side_effects: true` is not a blanket authorization and does not bypass this policy; unknown-risk and side-effect flows require an interactive per-run review.
 - `POST /agent/flow/run {"id": "app/flow", "inputs"?: {…}, "confirm"?: bool}` runs a flow now, in process, as the caller's owner, and answers `{"ok", "result"}`.
 - `GET /agent/flows[?app=<bundle>]` lists the flows this daemon can run (registry + local), as `iphone-use-mcp flow list --json` prints them.
+
+## Local flow authorization
+
+`iphone-use-mcp flow approve <file-or-id> --input KEY=VALUE` records an operator’s review of
+exact low-risk bytes and inputs. Inspect the flow first. This local CLI permission is stored
+outside the downloaded registry; a publisher’s `risk` label or hash cannot approve itself.
+A content or input change invalidates it. `--force` only overrides compatibility decisions,
+not this authorization boundary. Unapproved flows require `--confirm` for that invocation;
+tasks freeze the prepared flow and its inputs before displaying a revision-bound prompt.
+Unknown risk and side effects cannot receive permanent low-risk approval. This policy does
+not claim that JSON or a model can prove an arbitrary UI click free of real-world side effects.

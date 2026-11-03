@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>iPhone Use 安全管理</title>
+<style>body{font:16px system-ui;max-width:850px;margin:3rem auto;padding:0 1rem}input,select,button{font:inherit;margin:.4rem;padding:.5rem}pre{white-space:pre-wrap;overflow-wrap:anywhere}label{display:block}</style>
+<h1>设备与 Agent 授权</h1>
+<p>每次管理操作都需要重新验证管理员密码。撤销会同时阻止该设备续期与已有会话的后续请求，并取消它的运行任务。共享的旧 Agent token 显示为同一个身份。</p>
+<form id="admin"><label>管理员密码 <input id="password" type="password" autocomplete="current-password" required></label>
+<label>新 Agent 名称 <input id="name" maxlength="80"></label>
+<label>权限 <select id="scope"><option value="read">仅查看</option><option value="control">控制手机</option></select></label>
+<label>要撤销的凭据 ID <input id="credential" autocomplete="off"></label>
+<button type="submit" value="list">查看授权</button><button type="submit" value="create_agent">创建 Agent</button>
+<button type="submit" value="revoke">撤销指定授权</button><button type="submit" value="revoke_all">撤销全部（需重新登录）</button></form>
+<p>新 token 只显示一次，请保存到受保护的凭据库，不要粘贴到命令行参数或日志。此页面不提供开启无人值守升级的选项。</p>
+<pre id="result" aria-live="polite"></pre>
+<script>
+'use strict';
+document.getElementById('admin').addEventListener('submit', async event => {
+  event.preventDefault();
+  const action = event.submitter.value;
+  if (action === 'revoke_all' && !confirm('撤销所有会话和 Agent？所有旧设备将需要重新配对。')) return;
+  const password = document.getElementById('password');
+  const body = {action, admin_password:password.value, name:document.getElementById('name').value,
+    id:document.getElementById('credential').value, scope:document.getElementById('scope').value};
+  password.value = '';
+  const base = location.pathname.replace(/\/security\/?$/, '');
+  try {
+    const response = await fetch(base + '/agent/security/credentials', {method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json','X-Phone-Control':'1'},body:JSON.stringify(body)});
+    document.getElementById('result').textContent = JSON.stringify(await response.json(),null,2);
+  } catch { document.getElementById('result').textContent = '请求失败，未确认任何管理变更。'; }
+});
+</script></html>

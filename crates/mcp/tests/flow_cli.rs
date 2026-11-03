@@ -64,6 +64,7 @@ fn mock_daemon(responses: &[(&str, Option<&str>)]) -> (String, mpsc::Receiver<St
 struct Run {
     code: Option<i32>,
     stdout: String,
+    stderr: String,
     json: Option<serde_json::Value>,
 }
 
@@ -71,6 +72,18 @@ struct Run {
 /// test process's own environment is never touched, so these cases cannot
 /// interfere with each other or with anything else in the suite.
 fn flow_run(url: &str, flow: &Path, store: &Path, artifacts: Option<&Path>) -> Run {
+    flow_run_confirmed(url, flow, store, artifacts, true)
+}
+
+/// Outcome-contract fixtures explicitly authorize their synthetic flow. A
+/// separate negative test checks that --force never substitutes for approval.
+fn flow_run_confirmed(
+    url: &str,
+    flow: &Path,
+    store: &Path,
+    artifacts: Option<&Path>,
+    confirm: bool,
+) -> Run {
     let mut command = Command::new(env!("CARGO_BIN_EXE_iphone-use-mcp"));
     command
         .env_clear()
@@ -80,6 +93,9 @@ fn flow_run(url: &str, flow: &Path, store: &Path, artifacts: Option<&Path>) -> R
         .env("IPHONE_USE_TOKEN", "test-token")
         .env("IPHONE_USE_FLOWS_DIR", store)
         .args(["flow", "run", flow.to_str().unwrap(), "--force"]);
+    if confirm {
+        command.arg("--confirm");
+    }
     if let Some(artifacts) = artifacts {
         command.args(["--artifacts-dir", artifacts.to_str().unwrap()]);
     }
@@ -89,7 +105,28 @@ fn flow_run(url: &str, flow: &Path, store: &Path, artifacts: Option<&Path>) -> R
     Run {
         code: output.status.code(),
         stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         json,
+    }
+}
+
+#[test]
+fn force_cannot_authorize_an_unknown_or_self_declared_readonly_flow() {
+    for risk in [None, Some("read_only")] {
+        let home = tempfile::tempdir().unwrap();
+        let flow = write_flow(home.path());
+        if let Some(risk) = risk {
+            let mut value: serde_json::Value = serde_json::from_str(FLOW).unwrap();
+            value["risk"] = risk.into();
+            std::fs::write(&flow, value.to_string()).unwrap();
+        }
+        let (url, requests) = mock_daemon(&compat_preamble());
+        let run = flow_run_confirmed(&url, &flow, home.path(), None, false);
+        assert_ne!(run.code, Some(0));
+        assert!(run.stderr.contains("local approval"), "{}", run.stderr);
+        assert!(!requests
+            .try_iter()
+            .any(|request| request.starts_with("POST /agent/actions")));
     }
 }
 

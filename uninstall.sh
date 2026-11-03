@@ -1622,17 +1622,9 @@ fi
 printf '\n=== iphone-use safe uninstall ===\n\n'
 [ "$DRY_RUN" = "0" ] || info "dry-run: no process, file, app, or phone will be changed"
 
-info "1/5 stopping the iphone-use daemon"
-DAEMON_RUNTIME_CLEAN=1
-LEGACY_RUNTIME_CLEAN=1
-stop_owned_job daemon "$DAEMON_LABEL" "$DAEMON_PLIST" || DAEMON_RUNTIME_CLEAN=0
-if [ "$INSTANCE_NAME" = default ]; then
-    stop_owned_job legacy "$LEGACY_LABEL" "$LEGACY_PLIST" || LEGACY_RUNTIME_CLEAN=0
-fi
-
-# The daily auto-update job (scripts/auto-update.sh) serves every instance, so
-# it goes with the default one. Ours only when it runs ~/.iphone-use/auto-update.sh.
-if [ "$INSTANCE_NAME" = default ]; then
+# Stop the shared updater BEFORE touching any instance. Otherwise an older
+# job could reinstall files while they are being removed. Only the default
+# uninstall removes shared updater files; named uninstalls leave them disabled.
     AUTO_UPDATE_LABEL="com.leeguoo.iphone-use.autoupdate"
     AUTO_UPDATE_PLIST="$HOME/Library/LaunchAgents/$AUTO_UPDATE_LABEL.plist"
     if [ -f "$AUTO_UPDATE_PLIST" ] && [ ! -L "$AUTO_UPDATE_PLIST" ]; then
@@ -1641,17 +1633,28 @@ if [ "$INSTANCE_NAME" = default ]; then
             if [ "$DRY_RUN" = "1" ]; then
                 plan "launchctl bootout $GUI_DOMAIN/$AUTO_UPDATE_LABEL; remove $AUTO_UPDATE_PLIST"
             else
+                "$LAUNCHCTL_BIN" disable "$GUI_DOMAIN/$AUTO_UPDATE_LABEL" \
+                    || { fail "Could not disable automatic updates; refusing to continue uninstall."; exit 1; }
                 "$LAUNCHCTL_BIN" bootout "$GUI_DOMAIN/$AUTO_UPDATE_LABEL" 2>/dev/null || true
-                rm -f "$AUTO_UPDATE_PLIST" && ok "removed the auto-update job $AUTO_UPDATE_LABEL"
+                if "$LAUNCHCTL_BIN" print "$GUI_DOMAIN/$AUTO_UPDATE_LABEL" >/dev/null 2>&1; then
+                    fail "Automatic-update job is still loaded; no daemon or updater files have been removed. Inspect the active install before retrying."; exit 1
+                fi
+                if [ "$INSTANCE_NAME" = default ]; then
+                    rm -f "$AUTO_UPDATE_PLIST" && ok "removed the auto-update job $AUTO_UPDATE_LABEL"
+                fi
             fi
         else
             warn "preserving $AUTO_UPDATE_PLIST: it does not run $HOME/.iphone-use/auto-update.sh"
         fi
     fi
-    # A job we did not remove still runs the script: leave its files with it.
-    if [ "$STATE_SAFE" = "1" ] && [ -d "$STATE_DIR" ] \
+    if [ "$DRY_RUN" = 0 ] && "$LAUNCHCTL_BIN" print "$GUI_DOMAIN/$AUTO_UPDATE_LABEL" >/dev/null 2>&1; then
+        fail "An updater job is still loaded and could not be safely ownership-verified; nothing has been uninstalled."
+        exit 1
+    fi
+    # Keep shared updater artifacts when only a named instance is removed.
+    if [ "$INSTANCE_NAME" = default ] && [ "$STATE_SAFE" = "1" ] && [ -d "$STATE_DIR" ] \
         && { [ ! -e "$AUTO_UPDATE_PLIST" ] || [ "$DRY_RUN" = "1" ]; }; then
-        for AUTO_UPDATE_FILE in auto-update.sh auto-update.disabled auto-update-last.json; do
+        for AUTO_UPDATE_FILE in auto-update.sh auto-update-last.json; do
             [ ! -f "$STATE_DIR/$AUTO_UPDATE_FILE" ] \
                 || remove_file "$STATE_DIR/$AUTO_UPDATE_FILE" "$STATE_DIR/$AUTO_UPDATE_FILE"
         done
@@ -1663,7 +1666,15 @@ if [ "$INSTANCE_NAME" = default ]; then
             fi
         fi
     fi
+
+info "1/5 stopping the iphone-use daemon"
+DAEMON_RUNTIME_CLEAN=1
+LEGACY_RUNTIME_CLEAN=1
+stop_owned_job daemon "$DAEMON_LABEL" "$DAEMON_PLIST" || DAEMON_RUNTIME_CLEAN=0
+if [ "$INSTANCE_NAME" = default ]; then
+    stop_owned_job legacy "$LEGACY_LABEL" "$LEGACY_PLIST" || LEGACY_RUNTIME_CLEAN=0
 fi
+
 
 info "2/5 stopping the product-owned runner supervisor and PID-verified processes"
 IPU_RUNNER_RUNTIME_CLEAN=1

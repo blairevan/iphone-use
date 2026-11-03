@@ -29,9 +29,38 @@ const HOP_BY_HOP = new Set([
   "proxy-authorization", "te", "trailer", "content-length",
 ]);
 
+/** Bound streamed bodies while reading, not after allocating an arbitrary body. */
+async function boundedBody(request: Request): Promise<Uint8Array | null> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_REQUEST_BODY)) return null;
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_REQUEST_BODY) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.length; }
+  return body;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (url.protocol !== "https:") return new Response("HTTPS required\n", { status: 403 });
     const match = url.pathname.match(/^\/(t|p)\/([^/]+)(\/.*)?$/);
     if (!match) {
       return url.pathname === "/" ? new Response("iphone-use relay\n") : new Response("not found\n", { status: 404 });
@@ -50,6 +79,7 @@ type Pending = {
 
 export class Phone implements DurableObject {
   private pending = new Map<number, Pending>();
+  private admitting = 0;
   private nextId = 1;
 
   constructor(private state: DurableObjectState, _env: Env) {
@@ -58,7 +88,10 @@ export class Phone implements DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const [, kind, , rest] = url.pathname.match(/^\/(t|p)\/([^/]+)(\/.*)?$/)!;
+    if (url.protocol !== "https:") return new Response("HTTPS required\n", { status: 403 });
+    const match = url.pathname.match(/^\/(t|p)\/([^/]+)(\/.*)?$/);
+    if (!match || !ID.test(match[2])) return new Response("not found\n", { status: 404 });
+    const [, kind, , rest] = match;
     return kind === "t" ? this.openTunnel(request) : this.forward(request, url, rest ?? "/");
   }
 
@@ -83,24 +116,37 @@ export class Phone implements DurableObject {
   private async forward(request: Request, url: URL, path: string): Promise<Response> {
     const tunnel = this.state.getWebSockets()[0];
     if (!tunnel) return new Response("phone offline\n", { status: 502, headers: { "x-relay-error": "phone_offline" } });
-    if (this.pending.size >= MAX_PENDING) return new Response("too many requests\n", { status: 503 });
-    const body = request.body ? new Uint8Array(await request.arrayBuffer()) : new Uint8Array();
-    if (body.length > MAX_REQUEST_BODY) return new Response("request too large\n", { status: 413 });
+    if (this.pending.size + this.admitting >= MAX_PENDING) return new Response("too many requests\n", { status: 503 });
+    this.admitting += 1;
+    let body: Uint8Array | null;
+    try { body = await boundedBody(request); }
+    catch { return new Response("request body unavailable\n", { status: 400 }); }
+    finally { this.admitting -= 1; }
+    if (body === null) return new Response("request too large\n", { status: 413 });
+    if (request.signal.aborted) return new Response("request cancelled\n", { status: 499 });
     const headers: [string, string][] = [];
     request.headers.forEach((value, name) => {
-      if (!HOP_BY_HOP.has(name) && !name.startsWith("cf-")) headers.push([name, value]);
+      if (!HOP_BY_HOP.has(name) && !name.startsWith("cf-")
+        && !name.startsWith("x-iphone-use-") && !name.startsWith("x-forwarded-")
+        && name !== "forwarded" && name !== "x-real-ip") headers.push([name, value]);
     });
     headers.push(["x-forwarded-proto", "https"], ["x-forwarded-host", url.host]);
+    // Cloudflare overwrites this at the edge; never relay a visitor-supplied
+    // forwarding chain as a source identity. Older workers without the field
+    // use the shared relay budget rather than trusting arbitrary X-Real-IP.
+    const source = request.headers.get("cf-connecting-ip");
     const id = this.nextId++;
     const response = new Promise<Response>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        try { tunnel.send(JSON.stringify({ t: "cancel", id })); } catch {}
         resolve(new Response("phone did not answer\n", { status: 504 }));
       }, RESPONSE_TIMEOUT_MS);
       this.pending.set(id, { writer: null, resolve, timer });
     });
     request.signal?.addEventListener("abort", () => this.cancel(id));
-    tunnel.send(JSON.stringify({ t: "req", id, m: request.method, p: path + url.search, h: headers, b: base64(body) }));
+    try { tunnel.send(JSON.stringify({ t: "req", id, m: request.method, p: path + url.search, h: headers, b: base64(body), source })); }
+    catch { this.cancel(id); }
     return response;
   }
 
@@ -109,8 +155,9 @@ export class Phone implements DurableObject {
     if (!entry) return;
     clearTimeout(entry.timer);
     this.pending.delete(id);
+    entry.resolve(new Response("request cancelled\n", { status: 499 }));
     entry.writer?.close().catch(() => {});
-    this.state.getWebSockets()[0]?.send(JSON.stringify({ t: "cancel", id }));
+    try { this.state.getWebSockets()[0]?.send(JSON.stringify({ t: "cancel", id })); } catch {}
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {

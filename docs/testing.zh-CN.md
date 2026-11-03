@@ -117,10 +117,10 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: 安装 iphone-use（不做设备配置，不注册 MCP 客户端）
+      - name: 使用已审查并预先配置的 iphone-use（不执行网络安装）
         run: |
-          curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh \
-            | IPHONE_USE_NO_SETUP=1 IPHONE_USE_NO_CLIENT_SETUP=1 sh
+          test -x "$HOME/.local/bin/iphone-use"  # reviewed, pre-provisioned runner
+          "$HOME/.local/bin/iphone-use" upgrade --check
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: 启动模拟器、runner 和守护进程
         run: iphone-use simulator start "iPhone 15" --instance ci-sim

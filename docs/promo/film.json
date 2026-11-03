@@ -91,7 +91,7 @@
       "#34 [Button] \"画中画\"",
       "#38 [Button] \"屏幕捕捉\""
     ],
-    "install": "curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh",
+    "install": "bash install.sh ./iPhoneUse.app --no-setup",
     "repo": "github.com/leeguooooo/iphone-use"
   },
   "copy": {

@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# install.sh turns the auto-update job on at every install, unless the user
-# turned it off (persistently), CI or the update check says leave it, or the
-# install itself runs under the job (reloading the job would kill it). And an
-# upgrade carries forward every IPHONE_USE_* / IPU_RUNNER_* setting of the old
-# plist, so the nightly upgrade never drops one. The functions are extracted
-# from install.sh and run against a stub auto-update.sh and throwaway plists.
+# The installer always retires unattended upgrades without fetching a script.
+# Existing user settings are still carried forward. All launchctl calls are mocked.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,40 +14,51 @@ bad()  { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 FUNCS="$(sed -n '/^plist_env_get_from() {$/,/^}$/p;/^legacy_env_names() {$/,/^}$/p;/^plist_own_env_keys() {$/,/^}$/p;/^setup_auto_update() {$/,/^}$/p' "$ROOT/install.sh")"
 [ -n "$FUNCS" ] || bad "setup_auto_update / plist_own_env_keys not found in install.sh"
 
-# A stub auto-update.sh that records how it was called.
-mkdir -p "$TMP/checkout/scripts"
-cat > "$TMP/checkout/scripts/auto-update.sh" <<EOF
+mkdir -p "$TMP/bin" "$TMP/home/.iphone-use"
+cat > "$TMP/bin/launchctl" <<'MOCK'
 #!/bin/bash
-echo "\$1 state_dir=\${IPHONE_USE_STATE_DIR:-unset}" >> "$TMP/calls"
-EOF
-
-setup() {  # setup [VAR=value ...] -> the stub's calls, one per line
+printf '%s\n' "$*" >> "$CALLS"
+case "$1" in
+    print) [ "${STUCK_JOB:-0}" = 1 ] ;;
+    disable|bootout) exit 0 ;;
+    *) exit 99 ;;
+esac
+MOCK
+chmod +x "$TMP/bin/launchctl"
+setup() {
     rm -f "$TMP/calls"
-    env -i HOME="$TMP/home" PATH=/usr/bin:/bin "$@" bash -c "
+    env -i HOME="$TMP/home" PATH="$TMP/bin:/usr/bin:/bin" CALLS="$TMP/calls" "$@" bash -c "
 info() { :; }; ok() { :; }; warn() { :; }
-SCRIPT_IS_LOCAL=1; SCRIPT_DIR='$TMP/checkout'; REPO=x/y; LOG_DIR='$TMP/logs'
 $FUNCS
 setup_auto_update"
-    cat "$TMP/calls" 2>/dev/null || true
 }
-
-mkdir -p "$TMP/home/.iphone-use"
-[ "$(setup)" = "enable state_dir=unset" ] || bad "a plain install did not enable the job: '$(setup)'"
-ok_t "a plain install turns the job on"
-[ "$(setup IPHONE_USE_STATE_DIR=/elsewhere)" = "enable state_dir=unset" ] \
-    || bad "the daemon's IPHONE_USE_STATE_DIR leaked into the job: '$(setup IPHONE_USE_STATE_DIR=/elsewhere)'"
-ok_t "the daemon's state dir does not move the job's files"
-[ "$(setup IPHONE_USE_AUTO_UPDATE=0)" = "disable state_dir=unset" ] \
-    || bad "IPHONE_USE_AUTO_UPDATE=0 did not disable the job"
-ok_t "--no-auto-update / IPHONE_USE_AUTO_UPDATE=0 turns it off"
-touch "$TMP/home/.iphone-use/auto-update.disabled"
-[ -z "$(setup)" ] || bad "an install re-enabled a job the user disabled"
-ok_t "a disabled job stays off across installs"
-rm -f "$TMP/home/.iphone-use/auto-update.disabled"
-for var in IPHONE_USE_AUTO_UPDATE_JOB=1 IPHONE_USE_AUTO_UPDATE=1 CI=1 IPHONE_USE_NO_UPDATE_CHECK=1 USE_NO_UPDATE_CHECK=1; do
-    [ -z "$(setup "$var")" ] || bad "$var still touched the job"
+setup || bad "plain install failed"
+[ -f "$TMP/home/.iphone-use/auto-update.disabled" ] || bad "no persistent opt-out"
+[ "$(stat -f %Lp "$TMP/home/.iphone-use/auto-update.disabled")" = 600 ] || bad "opt-out permissions"
+grep -q '^disable ' "$TMP/calls" || bad "launchd not disabled"
+! grep -Eq '^(enable|bootstrap)' "$TMP/calls" || bad "scheduled an automatic updater"
+ok_t "new installation persistently disables unattended updates"
+for setting in IPHONE_USE_STATE_DIR=/elsewhere IPHONE_USE_AUTO_UPDATE=1 IPHONE_USE_AUTO_UPDATE=0 IPHONE_USE_NO_UPDATE_CHECK=1 USE_NO_UPDATE_CHECK=1; do
+    setup "$setting" || bad "$setting failed"
+    grep -q '^disable ' "$TMP/calls" || bad "$setting bypassed disable"
 done
-ok_t "under the job, in CI or with the update check off, the job is left alone"
+ok_t "legacy flags and custom instance state do not enable the global updater"
+setup IPHONE_USE_AUTO_UPDATE_JOB=1 || bad "active transaction handling failed"
+grep -q '^disable ' "$TMP/calls" || bad "active job not disabled for next launch"
+! grep -q '^bootout ' "$TMP/calls" || bad "killed the installer executing this release"
+ok_t "an active upgrade may finish but cannot schedule another one"
+setup CI=1 || bad "CI opt-out failed"
+[ ! -e "$TMP/calls" ] || bad "CI touched launchd"
+ok_t "CI persists opt-out without touching launchd"
+mkdir -p "$TMP/home/Library/LaunchAgents"
+job="$TMP/home/Library/LaunchAgents/com.leeguoo.iphone-use.autoupdate.plist"
+touch "$job"
+if setup STUCK_JOB=1; then bad "reported success with updater still loaded"; fi
+[ -f "$job" ] || bad "removed live job plist"
+ok_t "failed stop keeps the plist and reports failure"
+setup || bad "stop failed"
+[ ! -e "$job" ] || bad "stopped job plist survived"
+ok_t "confirmed stop removes the scheduled job"
 
 cat > "$TMP/old.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

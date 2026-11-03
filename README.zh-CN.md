@@ -25,8 +25,10 @@ Claude Code、Codex 或任何 MCP 客户端都能用它把屏幕读成文字，�
 
 <p align="center"><strong>官网与文档：<a href="https://iphone-use.leeguoo.com/">iphone-use.leeguoo.com</a></strong></p>
 
+**安全加固版本：无人值守升级默认关闭；不再执行网络下载的安装脚本。** 首次安装请先审查固定版本源码，在本地构建并用 `scripts/make-app.sh` 打包 `iPhoneUse.app`，再运行下列命令。已有验证器时，使用[独立信任根与签名离线发布包](docs/security/signed-releases.md)，不能把下载站旁边的哈希当作发布者身份。远程入口默认关闭，需[显式配置 HTTPS](docs/security/remote-access.md)。
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+bash install.sh ./iPhoneUse.app --no-setup
 ```
 
 https://github.com/user-attachments/assets/6192e8a6-ab2d-4dfc-b2e9-2c971f527d55
@@ -114,7 +116,7 @@ iphone-use doctor    # 缺什么、怎么补
 iphone-use setup     # 重新配置手机（换了 iPhone 或 Xcode 之后）
 iphone-use try       # 无害的检查：打开设置、读屏、回桌面
 iphone-use login     # 重新登录浏览器，附手机扫码用的二维码
-iphone-use upgrade   # 升级全部组件
+iphone-use upgrade --check   # 只检查版本，不安装
 ~/.iphone-use/uninstall.sh --dry-run   # 看卸载会删掉什么（去掉 --dry-run 就真的卸载）
 ```
 
@@ -124,7 +126,7 @@ iphone-use upgrade   # 升级全部组件
 
 ```text
 在这台 Mac 上安装 iphone-use（https://github.com/leeguooooo/iphone-use），让你能操作我的 iPhone。
-1. 运行：curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+1. 先审查固定版本源码并本地构建，或以独立配置的信任根验证完整签名离线包；不直接执行下载脚本。本地审查构建后运行：bash install.sh ./iPhoneUse.app --no-setup
 2. 运行 `iphone-use doctor`。终端里能修的直接修；它让你运行 `iphone-use setup` 时就运行。
 3. 有几步只能我自己做：在 Xcode 里登录 Apple ID、在 iPhone 上点「信任」、打开开发者模式、
    解锁手机。遇到这些就停下，告诉我具体怎么做，等我说做完了再继续。不要向我要密码或验证码。
@@ -296,7 +298,7 @@ iphone-use 侧重真机 runner、明确的动作结果和确定性流程回放�
 ## `*-use` 家族
 
 一组小而互相独立的 CLI，各自把 agent 的手伸到一个真实的东西上。装法都一样：
-`curl … install.sh | sh` 装命令，输出都是 JSON，并各自配一个 skill 教会 agent 使用
+经审查的本地安装器安装命令，输出都是 JSON，并各自配一个 skill 教会 agent 使用
 ——skill 怎么装以各仓库自己的 README 与对应发行版说明为准，各项目、各版本并不相同。
 
 | 仓库 | 给 agent 的能力 |

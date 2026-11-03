@@ -59,7 +59,7 @@ ok_t "an old environment variable still overrides the plist"
 
 got="$(bash -c "$DAEMON_ENV
 daemon_env '$TMP/old.plist'")"
-[ "$got" = "45432 old-token 0.0.0.0" ] || bad "auto-update read '$got' from an old plist"
+[ "$got" = $'45432\nold-token\n0.0.0.0' ] || bad "auto-update did not preserve the old plist's three separate values"
 ok_t "auto-update reads port, token and host from an old plist"
 
 printf '1..%d\n' "$pass"

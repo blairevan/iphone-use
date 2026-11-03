@@ -1,5 +1,24 @@
 import Foundation
 
+/// Persist a revocation independently of Keychain deletion, which can fail
+/// while locked. Network recovery and process restarts cannot clear consent.
+enum PairingRevocation {
+    /// Only newly typed credentials or a newly scanned code may bypass the latch.
+    static func requiresAuthorization(address: String, freshCredential: Bool, defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: "pairingRevoked:" + address) && !freshCredential
+    }
+
+    /// Called only after a genuine server revocation, never a generic proxy 401.
+    static func mark(address: String, defaults: UserDefaults = .standard) {
+        defaults.set(true, forKey: "pairingRevoked:" + address)
+    }
+
+    /// Clear only after the server accepts newly supplied user authorization.
+    static func authorized(address: String, defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: "pairingRevoked:" + address)
+    }
+}
+
 // The connection lifecycle, as pure values: what went wrong when reaching a
 // daemon, what a typed address means, how long to wait before trying again,
 // and what the screen says about it. No UI and no networking here, so every

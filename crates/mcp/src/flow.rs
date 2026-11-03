@@ -184,6 +184,8 @@ impl FlowMeta {
 
 #[derive(Debug)]
 pub struct ValidatedFlow {
+    /// Digest of the exact bytes parsed, not a hash supplied by the registry.
+    pub content_sha256: String,
     pub meta: FlowMeta,
     pub inputs: BTreeMap<String, FlowInputDefinition>,
     pub step_templates: Vec<serde_json::Value>,
@@ -550,6 +552,7 @@ pub fn parse_flow(bytes: &[u8], origin: &str) -> Result<ValidatedFlow> {
     let validated_steps = materialize_steps(&document.steps, &document.inputs, None)?;
     phone_steps_request(validated_steps).map_err(anyhow::Error::msg)?;
     Ok(ValidatedFlow {
+        content_sha256: registry::sha256_hex(bytes),
         meta: FlowMeta {
             name: name.to_string(),
             description: document.description,
@@ -1620,7 +1623,7 @@ pub async fn compat_gate(
 }
 
 /// Execute one validated flow exactly once. `confirm` is the explicit
-/// acknowledgement a `risk:"side_effect"` flow requires; without it nothing is
+/// acknowledgement an unreviewed or side-effect flow requires; without it nothing is
 /// sent. Unverified flows still run (that is how they get verified) but the
 /// caller is expected to surface `verified:false` from the summary.
 /// Whether this error proves the request never left this machine.
@@ -1683,16 +1686,16 @@ pub async fn execute_flow_run(
     // Every request of the replay says it is one (task metrics count flows).
     let flow_client = daemon.for_flow();
     let daemon = &flow_client;
-    if flow.meta.risk == Some(FlowRisk::SideEffect) && !confirm {
+    let request = materialized_request(flow, inputs)?;
+    if !confirm && !crate::flow_policy::is_approved(flow, inputs)? {
         bail!(
-            "flow {:?} is declared risk=side_effect (sends, publishes, pays, or deletes); \
-             re-run with --confirm (CLI) or confirm=true (MCP) after checking the target and \
-             inputs. No action was sent",
-            flow.name()
+            "flow {:?} (risk={}) has no local approval for these exact bytes and inputs; \
+             re-run with --confirm (CLI) or confirm=true (MCP) after reviewing the target, \
+             steps and inputs. Downloaded risk labels do not grant trust. No action was sent",
+            flow.name(),
+            flow.meta.risk_label()
         );
     }
-    let steps = materialize_steps(&flow.step_templates, &flow.inputs, Some(inputs))?;
-    let request = phone_steps_request(steps).map_err(anyhow::Error::msg)?;
     let status_body = daemon
         .get_text("/agent/status")
         .await
@@ -1740,6 +1743,16 @@ pub async fn execute_flow_run(
         daemon_version,
         preflight_status: status,
     })
+}
+
+/// Resolve and validate the invocation locally before any approval or network
+/// request. The content digest includes template defaults and output selectors.
+pub fn materialized_request(
+    flow: &ValidatedFlow,
+    inputs: &BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let steps = materialize_steps(&flow.step_templates, &flow.inputs, Some(inputs))?;
+    phone_steps_request(steps).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
@@ -1990,7 +2003,7 @@ mod tests {
             &flow,
             &BTreeMap::new(),
             &DaemonClient::new(url, None),
-            false,
+            true, // explicit approval of the synthetic test fixture
         )
         .await
         .unwrap_err()
@@ -2771,7 +2784,7 @@ mod tests {
 
         let (url, task, _requests) =
             mock_daemon_sequence(&[("200 OK", status), ("409 Conflict", failure)]);
-        let run = execute_flow_run(&flow, &BTreeMap::new(), &DaemonClient::new(url, None), false)
+        let run = execute_flow_run(&flow, &BTreeMap::new(), &DaemonClient::new(url, None), true)
             .await
             .expect("a failed flow is a result, not an error");
         task.join().unwrap();
@@ -2794,8 +2807,8 @@ mod tests {
     /// as an error, `run_command` returned early, and the diagnosis and the
     /// evidence file never happened at all — on precisely the runs they exist
     /// for.
-    #[tokio::test]
-    async fn a_failing_run_still_reports_diagnoses_and_records() {
+    #[test]
+    fn a_failing_run_still_reports_diagnoses_and_records() {
         let home = tempfile::tempdir().unwrap();
         let flow_path = home.path().join("flow.json");
         fs::write(&flow_path, valid_flow()).unwrap();
@@ -2824,15 +2837,18 @@ mod tests {
         std::env::set_var("IPHONE_USE_URL", &url);
         std::env::set_var(registry::STORE_ENV, store.path());
 
-        let error = run_command(
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime.block_on(run_command(
             flow_path.to_str().unwrap(),
             &[],
-            false,
+            true, // approve this fixture, not a downloaded risk label
             true, // --force: compat is not what this test is about
             Some(&runs),
             None,
-        )
-        .await
+        ))
         .expect_err("a failed flow must still exit non-zero");
         task.join().unwrap();
         std::env::remove_var("IPHONE_USE_URL");
@@ -2897,7 +2913,7 @@ mod tests {
             &flow,
             &BTreeMap::new(),
             &DaemonClient::new(url, None),
-            false,
+            true, // explicit approval of the synthetic test fixture
         )
         .await
         .unwrap();
@@ -2935,9 +2951,10 @@ mod tests {
             ("200 OK", result),
             ("200 OK", tree),
         ]);
-        let run = execute_and_diagnose(&flow, &BTreeMap::new(), &DaemonClient::new(url, None), false)
-            .await
-            .unwrap();
+        let run =
+            execute_and_diagnose(&flow, &BTreeMap::new(), &DaemonClient::new(url, None), true)
+                .await
+                .unwrap();
         task.join().unwrap();
         assert!(run.succeeded);
         assert_eq!(run.value["outputs"], serde_json::json!({"steps": 8532, "title": "摘要"}));

@@ -1,120 +1,19 @@
 #!/usr/bin/env bash
-# scripts/sign.sh — codesign iPhoneUse.app with a stable identity
-#
-# Usage:
-#   ./scripts/sign.sh [APP_PATH]
-#
-# APP_PATH defaults to ./iPhoneUse.app
-#
-# Identity selection (first match wins):
-#   1. $SIGN_IDENTITY env var  — use verbatim (Developer ID Application or cert name)
-#   2. Any "Developer ID Application" cert in the login keychain
-#   3. Self-signed "iPhoneUse Local Signing" cert (created if absent)
-#
-# Why a STABLE identity matters:
-#   TCC grants (Screen Recording, Accessibility) are keyed on the Designated
-#   Requirement (bundle-id + signing identity hash).  Ad-hoc signing changes the
-#   cdhash on every build → grants lost.  A reused self-signed cert keeps the DR
-#   stable across rebuilds, just like Developer ID does.
-#
-# Signing order: nested binary FIRST, then the outer .app bundle.
-#
+# Sign a locally built app. Production identities require explicit selection.
+# Usage: SIGN_IDENTITY="Developer ID Application: ..." bash scripts/sign.sh APP
+# Without SIGN_IDENTITY, use keychain-free ad-hoc signing. The direct daemon
+# does not need a stable legacy Mirroring/TCC signing identity. This script
+# never discovers, creates, exports or unlocks a private key or changes the
+# user's keychain search list. Existing local identities are left untouched.
 set -eu
-
+umask 077
 APP="${1:-"$(pwd)/iPhoneUse.app"}"
-CERT_NAME="iPhoneUse Local Signing"
 BUNDLE_ID="com.leeguoo.iphone-use"
-
-# Dedicated signing keychain. We own its password, so partition-list setup is
-# fully non-interactive — no GUI "Always Allow" prompt, no login password.
-SIGN_KEYCHAIN="$HOME/Library/Keychains/iphone-use-signing.keychain-db"
-SIGN_KC_PASS="iphone-use-local-only"
-
-# ── Create (once) a self-signed Code Signing identity in a dedicated keychain ─
-# A STABLE signing identity keeps the Designated Requirement constant across
-# rebuilds, so TCC grants (Screen Recording, Accessibility) survive — unlike
-# ad-hoc signing, whose cdhash changes every build and drops the grants.
-_ensure_local_signing_cert() {
-    # Already present? Use `find-certificate`, NOT `find-identity`. A self-signed
-    # cert isn't *trusted*, so BOTH `find-identity -v` and `-p codesigning` hide
-    # it (they apply a trust/validity policy) even though codesign signs with it
-    # fine. Using find-identity here made the check always fail → a NEW cert (new
-    # hash → new DR) every run, defeating the whole point. find-certificate looks
-    # it up by name regardless of trust.
-    if security find-certificate -c "$CERT_NAME" "$SIGN_KEYCHAIN" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    echo "Creating self-signed Code Signing identity '$CERT_NAME' (one-time) ..." >&2
-    local tmpdir; tmpdir="$(mktemp -d)"
-    local key="$tmpdir/key.pem" cert="$tmpdir/cert.pem" p12="$tmpdir/cert.p12"
-    local ext="$tmpdir/ext.cnf" p12pass="pw"
-
-    # A code-signing LEAF cert: CA:false + the codeSigning EKU is what codesign
-    # requires (the old v3_ca extension produced a CA cert codesign rejects).
-    cat > "$ext" <<EOF
-[req]
-distinguished_name = dn
-x509_extensions = v3
-prompt = no
-[dn]
-CN = $CERT_NAME
-[v3]
-basicConstraints = critical,CA:false
-keyUsage = critical,digitalSignature
-extendedKeyUsage = critical,codeSigning
-EOF
-    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-        -keyout "$key" -out "$cert" -config "$ext" 2>/dev/null
-    # -legacy: macOS `security import` can't read OpenSSL 3's default PKCS#12 AES.
-    openssl pkcs12 -export -legacy -in "$cert" -inkey "$key" -out "$p12" \
-        -passout "pass:$p12pass" -name "$CERT_NAME" 2>/dev/null
-
-    # Dedicated keychain whose password we know → no prompts, no login keychain.
-    security create-keychain -p "$SIGN_KC_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
-    security set-keychain-settings "$SIGN_KEYCHAIN"          # no auto-lock timeout
-    security unlock-keychain -p "$SIGN_KC_PASS" "$SIGN_KEYCHAIN"
-    security import "$p12" -k "$SIGN_KEYCHAIN" -P "$p12pass" \
-        -T /usr/bin/codesign -A
-    # Authorize codesign to use the private key without a GUI prompt.
-    security set-key-partition-list -S apple-tool:,apple: -s \
-        -k "$SIGN_KC_PASS" "$SIGN_KEYCHAIN" >/dev/null 2>&1
-    rm -rf "$tmpdir"
-    echo "Created '$CERT_NAME' in $SIGN_KEYCHAIN" >&2
-}
-
-# Make the dedicated keychain visible to codesign's identity search.
-_add_signing_keychain_to_search() {
-    local cur
-    cur="$(security list-keychains -d user | sed 's/[" ]//g' | tr '\n' ' ')"
-    case " $cur " in
-        *" $SIGN_KEYCHAIN "*) : ;;  # already in the list
-        *) security list-keychains -d user -s "$SIGN_KEYCHAIN" $cur ;;
-    esac
-    security unlock-keychain -p "$SIGN_KC_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
-}
-
-# ── Resolve signing identity ─────────────────────────────────────────────────
-if [ -n "${SIGN_IDENTITY:-}" ]; then
-    IDENTITY="$SIGN_IDENTITY"
-    echo "Using provided SIGN_IDENTITY: $IDENTITY"
+IDENTITY="${SIGN_IDENTITY:--}"
+if [ "$IDENTITY" = - ]; then
+    echo "Signing locally with an ad-hoc identity; no private key is accessed."
 else
-    # Prefer a real Developer ID if the user has one.
-    DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null \
-              | grep 'Developer ID Application' \
-              | head -1 \
-              | sed 's/.*"\(.*\)".*/\1/' || true)"
-
-    if [ -n "$DEV_ID" ]; then
-        IDENTITY="$DEV_ID"
-        echo "Found Developer ID: $IDENTITY"
-    else
-        # Stable self-signed identity in our dedicated keychain.
-        _ensure_local_signing_cert
-        _add_signing_keychain_to_search
-        IDENTITY="$CERT_NAME"
-        echo "Using stable self-signed identity: $CERT_NAME"
-    fi
+    echo "Signing with the explicitly selected identity."
 fi
 
 # ── Verify the .app exists ────────────────────────────────────────────────────

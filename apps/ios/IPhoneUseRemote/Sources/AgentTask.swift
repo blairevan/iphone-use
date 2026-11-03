@@ -118,12 +118,14 @@ struct AgentConfirm: Decodable, Equatable, Sendable {
     var target: String?
     var reason: String?
     var app: String?
+    var confirmationID: String?
 
-    init(action: String, target: String? = nil, reason: String? = nil, app: String? = nil) {
+    init(action: String, target: String? = nil, reason: String? = nil, app: String? = nil, confirmationID: String? = nil) {
         self.action = action
         self.target = target
         self.reason = reason
         self.app = app
+        self.confirmationID = confirmationID
     }
 
     init(from decoder: Decoder) throws {
@@ -132,9 +134,13 @@ struct AgentConfirm: Decodable, Equatable, Sendable {
         target = try c.decodeIfPresent(String.self, forKey: .target)
         reason = try c.decodeIfPresent(String.self, forKey: .reason)
         app = try c.decodeIfPresent(String.self, forKey: .app)
+        confirmationID = try c.decodeIfPresent(String.self, forKey: .confirmationID)
     }
 
-    enum CodingKeys: String, CodingKey { case action, target, reason, app }
+    enum CodingKeys: String, CodingKey {
+        case action, target, reason, app
+        case confirmationID = "confirmation_id"
+    }
 }
 
 /// A task as `GET /agent/task/<id>` reports it (and, without steps, each
@@ -269,6 +275,7 @@ protocol AgentTaskAPI: Sendable {
     func startTask(_ request: AgentTaskRequest, returnBundle: String?) async throws -> String
     func task(id: String, since: Int) async throws -> AgentTaskSnapshot
     func answer(task id: String, approve: Bool) async throws
+    func answer(task id: String, approve: Bool, confirmationID: String?) async throws
     func cancelTask(id: String) async throws
     func recentTasks() async throws -> [AgentTaskSnapshot]
     func pauseTask(id: String) async throws
@@ -276,6 +283,11 @@ protocol AgentTaskAPI: Sendable {
 }
 
 extension AgentTaskAPI {
+    /// Compatibility for in-process adapters and older test doubles. The real
+    /// daemon client below sends the exact displayed prompt's revision.
+    func answer(task id: String, approve: Bool, confirmationID: String?) async throws {
+        try await answer(task: id, approve: approve)
+    }
     func pauseTask(id: String) async throws { throw AgentTaskError.unsupported }
     func resumeTask(id: String) async throws { throw AgentTaskError.unsupported }
 }
@@ -311,8 +323,16 @@ extension DaemonClient: AgentTaskAPI {
 
     /// `POST /agent/task/<id>/confirm`: the person's answer to `needs_confirm`.
     func answer(task id: String, approve: Bool) async throws {
+        throw AgentTaskError.refused("请刷新确认提示后再操作；回答必须绑定所看到的步骤。")
+    }
+
+    /// Do not fetch a fresh prompt here: that would apply an old tap to a new
+    /// action. Send only the revision captured when the person saw the prompt.
+    func answer(task id: String, approve: Bool, confirmationID: String?) async throws {
         var urlRequest = agentRequest("agent/task/\(id)/confirm", method: "POST")
-        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: ["approve": approve])
+        var body: [String: Any] = ["approve": approve]
+        if let confirmationID { body["confirmation_id"] = confirmationID }
+        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await send(urlRequest, repeatable: false)
         try Self.checkAgent(response, data)
     }

@@ -49,10 +49,10 @@ agent 或网页请求；后台定时任务和预热不会重连。`iphone-use pa
 ### 安装并接上第一台手机
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+bash install.sh ./iPhoneUse.app --no-setup
 ```
 
-安装器下载最新 GitHub Release，注册当前用户的 LaunchAgent，写入 loopback 的 runner 地址，安装同版本的 agent skill，把设备 runner 的源码放到 `~/.iphone-use/runner`，并把 `iphone-use` 命令链接到 `~/.local/bin`。在终端里首次安装时，它会接着做完：
+经审查的本地安装器注册当前用户的 LaunchAgent，写入 loopback 的 runner 地址，安装同版本的 agent skill，把设备 runner 的源码放到 `~/.iphone-use/runner`，并把 `iphone-use` 命令链接到 `~/.local/bin`。在终端里首次安装时，它会接着做完：
 
 - 插着 iPhone 的话，运行 `iphone-use setup`（编译、签名、安装并启动 runner，拉起中继）和 `iphone-use try`（打开设置、读屏、回桌面），安装结束前你就能看到 agent 操作手机；
 - 装了 Claude Code 的话，注册 MCP server（`claude mcp add-json -s user iphone-use …`，撤销用 `claude mcp remove -s user iphone-use`）。server 自己从 LaunchAgent 读守护进程地址和令牌，Claude 的配置里不会留下密钥；
@@ -68,13 +68,13 @@ iphone-use try       # 再跑一次无害的首次体验
 iphone-use login     # 新的一次性浏览器登录链接和手机二维码
 ```
 
-`iphone-use setup` 运行的是 `~/.iphone-use/setup-runner.sh`，它还接受 `status`、`pause`、`resume`、`stop`（如 `iphone-use setup status`）。控制页在 **`http://<Mac局域网IP>:44321/phone`**；**`/setup`** 把 `/agent/status` 翻译成当前的阻塞项（USB、信任、开发者服务、runner、外部主机），它不会改你的 VPN，也不会替你跑 setup。
+`iphone-use setup` 运行的是 `~/.iphone-use/setup-runner.sh`，它还接受 `status`、`pause`、`resume`、`stop`（如 `iphone-use setup status`）。控制页在 **`http://127.0.0.1:44321/phone`**（本机；其他设备使用显式配置的 HTTPS 入口）；**`/setup`** 把 `/agent/status` 翻译成当前的阻塞项（USB、信任、开发者服务、runner、外部主机），它不会改你的 VPN，也不会替你跑 setup。
 
 配对了多台 iPhone？两处固定同一个 classic UDID：
 
 ```bash
 export IPHONE_USE_UDID=00008…
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+bash install.sh ./iPhoneUse.app --no-setup
 IPU_RUNNER_UDID="$IPHONE_USE_UDID" ~/.iphone-use/setup-runner.sh
 ```
 
@@ -102,27 +102,26 @@ daemon 也会自己交还：5 分钟没有 agent 活动（释放后很快又被�
 > v0.9 移除了 iPhone 镜像后端；原来设了 `IPHONE_USE_BACKEND=mirror` 的安装，升级后一律走 runner。
 
 ```bash
-iphone-use upgrade            # 装最新 release（daemon + skill），再刷新其他地方的 skill
+iphone-use upgrade            # 只检查并通知，不安装
 iphone-use upgrade --check    # 什么都不改：输出 "iphone-use 0.6.6 -> 0.6.7" 或 "... is up to date"
 iphone-use upgrade --json     # 同上，JSON：name、current、latest、update_available、skills
 ```
 
-安装器会把 `~/.local/bin/iphone-use` 链到 app 里的可执行文件，`~/.local/bin` 在 PATH 上就能直接用。`upgrade` 跑的就是安装那行 `install.sh`（顺带刷新安装器管理的 skill），之后对插件装的 skill 跑 `claude plugin update iphone-use@leeguooooo-plugins`，对 git checkout 跑 `git pull --ff-only`，其他复制来的 skill 会被标为非 release 匹配，提示换成安装器装的那份。退出码 `0` = 升级了 / 已是最新 / 检查成功，`2` = 检查或下载失败。`cargo build` 出来的二进制不会被替换，`upgrade` 只打印安装命令。
+安装器把 `~/.local/bin/iphone-use` 链到 app 的可执行文件。`upgrade`、`upgrade --check` 和 `upgrade --json` 都只报告版本，不替换程序、插件或 skill。独立的 `release trust`／`release verify`／`release install --confirm` 路径验证完整签名离线包，包含信任根轮换、过期及防降级检查；初始信任根必须通过独立渠道核对后显式导入，不默认信任上游公钥。详见[签名发布](security/signed-releases.md)及[验收状态](security/hardening-status.md)。
 
 daemon 每天检查一次 GitHub，在 `/agent/status` 里报 `version` / `latest` / `update_available`，网页会挂横幅。一次性命令（`iphone-use stop`）每天最多在 stderr 打一行 `iphone-use X is available (you have Y). Upgrade: iphone-use upgrade`（缓存在 `${XDG_CACHE_HOME:-~/.cache}/iphone-use/update-check.json`，超时 2 秒）。设了 `CI`、`IPHONE_USE_NO_UPDATE_CHECK` 或 `USE_NO_UPDATE_CHECK`，每日检查和提示都关掉。安装器具体校验什么见[运维 → 升级](#升级-1)。
 
-**自动升级**默认开启，只在手机空闲时动手。安装器会注册一个每天 04:30 运行的任务，把这台 Mac 上的每个 daemon（默认实例和每个 `--instance`）升到最新 release，前提是有新版本，而且没人在用那台手机：没有 `X-Phone-Owner` 租约、没有 hold、daemon 不在释放或重连、没人在看画面、最近 15 分钟没有 agent 请求（看 `/agent/status` 的 `idle_secs`，用 `AUTO_UPDATE_IDLE_SECS` 改）。手机连着、runner 开着但没人操作，也算空闲。手机忙就跳过，第二天再试；每次判断在 `~/Library/Logs/iPhoneUse/auto-update.log` 记一行。
+**无人值守升级默认禁用。** 安装器写入持久禁用标记，并禁用、卸载旧的 `com.leeguoo.iphone-use.autoupdate` 任务；确认停止前不删除任务 plist。旧的 `IPHONE_USE_AUTO_UPDATE=1` 不再开启自动安装。若安装器本身由旧升级任务启动，只禁用后续调度，不中途杀死正在进行的安装事务。
 
-升级用的是该 release 自己的 `install.sh`，带 SHA-256 校验和回滚，daemon plist 里的设置全部保留。重启后的 daemon 报出新版本才算成功。结果写在 `~/.iphone-use/auto-update-last.json`，`/agent/status` 的 `auto_update`、`iphone-use doctor` 和 `iphone-use upgrade --check` 都会显示。
+本仓库新版 `scripts/auto-update.sh` 只检查版本并写出通知，不运行安装器，不执行 `main` 回退，不更新自身，不重签 App，也不构建 runner。`--force`、`--reinstall` 不能恢复这些执行能力。历史 `auto-update-last.json` 仅代表过去的升级记录，检查版本不会伪造一次成功安装。
 
 ```bash
 ~/.iphone-use/auto-update.sh disable    # 关掉，之后重装也保持关闭
-~/.iphone-use/auto-update.sh enable     # 重新打开
-~/.iphone-use/auto-update.sh status     # 开没开、现在会怎么做、上次结果
+~/.iphone-use/auto-update.sh status     # 调度状态与历史结果
 ~/.iphone-use/auto-update.sh run --dry-run
 ```
 
-安装时加 `--no-auto-update`（或 `IPHONE_USE_AUTO_UPDATE=0`）效果相同。设了 `CI`、`IPHONE_USE_NO_UPDATE_CHECK` 或 `USE_NO_UPDATE_CHECK` 时，安装器不动这个任务。
+以上命令仅适用于已安装并核实为本仓库新版的脚本；旧副本的 `enable` 仍可能启用无人值守安装，不要运行。新脚本的 `enable` 仅显式注册每天 04:30 的版本检查，不是自动安装；安装器不会自动注册它。`CI` 下仅写禁用标记、不访问 launchd；`IPHONE_USE_NO_UPDATE_CHECK` / `USE_NO_UPDATE_CHECK` 不再阻止安装器停用旧升级任务。
 
 ## 在浏览器里操作手机
 
@@ -398,7 +397,7 @@ claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp   # 只�
 
 `iphone-use simulator stop <名字|udid>` 会停止 daemon 和 runner，并释放 `sim` 实例。它只停止自己记录并核实过的进程，加 `--shutdown` 会同时关闭模拟器。
 
-`iphone-use setup --simulator <名字|udid>` 等同于 `simulator start`，跳过真机配置。安装器也支持 `--simulator <名字>`（`curl … install.sh | sh -s -- --simulator "iPhone 16 Pro"`）：装完后启动这台模拟器，并在 Claude Code 里注册名为 `iphone-sim` 的 MCP 服务；模拟器启动失败时安装也算失败。没插手机时，安装器的首次运行会提示可以改用 `simulator start`。`iphone-use doctor` 会多一行，列出可用和已启动的模拟器。
+`iphone-use setup --simulator <名字|udid>` 等同于 `simulator start`，跳过真机配置。安装器也支持 `--simulator <名字>`（`bash install.sh ./iPhoneUse.app --simulator "iPhone 16 Pro"`）：装完后启动这台模拟器，并在 Claude Code 里注册名为 `iphone-sim` 的 MCP 服务；模拟器启动失败时安装也算失败。没插手机时，安装器的首次运行会提示可以改用 `simulator start`。`iphone-use doctor` 会多一行，列出可用和已启动的模拟器。
 
 预览版还不支持以下内容：
 
@@ -417,7 +416,7 @@ claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp   # 只�
 ### 升级
 
 ```bash
-iphone-use upgrade    # 或者：curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+iphone-use upgrade --check    # 只检查；安装固定版本前须独立审查来源和安装器
 ```
 
 安装器把 release tag 解析成一个确定的 commit，helper 和 skill 都钉在上面；daemon app 取对应 Release asset 并校验 SHA-256；先把 skill 安装到 `~/.agents/skills/iphone-use`、逐字节校验落盘内容和 Claude Code 发现链接，再替换 daemon。skill 失败中止升级；之后 daemon 失败则恢复旧 skill。`IPHONE_USE_SKIP_SKILL=1` 保留现有 skill，这是降级安装，安装器不保证新 daemon 和旧 skill 兼容。已有的配置（`IPHONE_USE_RUNNER_URL`、密码、token、UDID）原样保留。`IPHONE_USE_NO_UPDATE_CHECK=1`（或 `IPHONE_USE_NO_UPDATE_CHECK=1` / `USE_NO_UPDATE_CHECK=1`）关掉每日检查。

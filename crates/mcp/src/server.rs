@@ -643,7 +643,8 @@ pub struct FlowRunParams {
     /// message content.
     #[serde(default)]
     pub inputs: std::collections::BTreeMap<String, String>,
-    /// Required for flows declared `risk: side_effect`. Set true only after
+    /// Required unless a local review covers these exact bytes and inputs;
+    /// unknown-risk and side_effect flows always require it. Set true only after
     /// the user confirmed the target and inputs.
     #[serde(default)]
     pub confirm: bool,

@@ -21,6 +21,35 @@ pub fn sign(key: &[u8], payload: &str) -> String {
     hmac_b64(key, payload)
 }
 
+/// Mint a production credential with an unpredictable, unique subject. Entropy
+/// failures are returned to the caller; never fall back to a time-derived id.
+pub fn try_make_token(secret: &[u8], ttl_secs: u64, now: u64) -> Result<String, getrandom::Error> {
+    let mut nonce = [0u8; 24];
+    getrandom::fill(&mut nonce)?;
+    Ok(token_for_subject(
+        secret,
+        ttl_secs,
+        now,
+        &URL_SAFE_NO_PAD.encode(nonce),
+    ))
+}
+
+/// Sign an internal, already verified subject for a renewed session. A caller
+/// must never take this subject directly from an unverified request body.
+pub fn token_for_subject(secret: &[u8], ttl_secs: u64, now: u64, subject: &str) -> String {
+    let exp = now.saturating_add(ttl_secs);
+    let payload = format!("{exp}:{subject}");
+    format!("{payload}:{}", hmac_b64(secret, &payload))
+}
+
+/// Read the subject ONLY after authenticating the entire credential. Device
+/// renewal preserves this identity; an unrelated device gets a different one.
+pub fn verified_subject(secret: &[u8], token: &str, now: u64) -> Option<String> {
+    check_token(secret, token, now)
+        .then(|| token.split(':').nth(1).map(str::to_owned))
+        .flatten()
+}
+
 /// Create a session token valid for `ttl_secs` seconds from `now`.
 /// `now` is injected (unix seconds) — no clock call inside.
 pub fn make_token(secret: &[u8], ttl_secs: u64, now: u64) -> String {
@@ -94,6 +123,21 @@ mod tests {
 
     const SECRET: &[u8] = b"test-secret-key-32-bytes-padding!";
     const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn production_tokens_minted_in_the_same_second_have_distinct_subjects() {
+        let a = try_make_token(SECRET, 3600, NOW).unwrap();
+        let b = try_make_token(SECRET, 3600, NOW).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(
+            verified_subject(SECRET, &a, NOW),
+            verified_subject(SECRET, &b, NOW)
+        );
+        assert!(verified_subject(b"wrong", &a, NOW).is_none());
+        let subject = verified_subject(SECRET, &a, NOW).unwrap();
+        let renewed = token_for_subject(SECRET, 7200, NOW, &subject);
+        assert_eq!(verified_subject(SECRET, &renewed, NOW), Some(subject));
+    }
 
     #[test]
     fn make_then_check_roundtrip_is_true() {
