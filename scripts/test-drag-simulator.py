@@ -305,7 +305,9 @@ def case(daemon, args, label, carrier, hover):
             child.update({"IPHONE_USE_URL": daemon.base, "IPHONE_USE_OWNER": daemon.owner,
                           "IPHONE_USE_INSTANCE": "fixture-" + nonce[:12],
                           "IPHONE_USE_FLOWS_DIR": str(out / "flows"), "IPHONE_USE_FLOWS_NO_AUTO_UPDATE": "1"})
-            ran = command([args.mcp, "flow", "run", flow], env=child, check=False, timeout=90)
+            # This generated flow targets only the owned simulator fixture;
+            # approve this invocation explicitly, not its downloaded risk label.
+            ran = command([args.mcp, "flow", "run", flow, "--confirm"], env=child, check=False, timeout=90)
             (out / "flow.log").write_text(ran.stdout + ran.stderr)
             reply = json.loads(ran.stdout)
             if ran.returncode:
