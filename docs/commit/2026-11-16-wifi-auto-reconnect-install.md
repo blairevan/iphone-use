@@ -5,7 +5,8 @@
 - 分支：`codex/wifi-auto-reconnect`，功能基线 `cc20df6`。
 - 语言与工具：Rust / Cargo / rustfmt / clippy；文档为 Markdown。
 - 正式安装原版本：0.27.34。本次从已验收功能分支构建同版本的本地发布构建。
-- 主检出由其他会话更新至 0.28.1，保留其改动，本次不合并该独立更新。
+- 主检出由其他会话更新至 0.28.1；初次安装时保留其独立更新，后续按用户
+  merge & push 授权完成集成，见文末记录。
 - Mac Shadowrocket 全程保持开启；保留配对身份及网络地址缓存。
 
 ## 提交流程
@@ -79,7 +80,8 @@
 - 持久备份：`~/Applications/.iphone-use-wifi-backup-gtjicxds/`，目录权限 0700，
   包含旧 App 和权限 0600 的原配置快照。配置快照只供追溯；回滚时也应将引擎
   指向正式 App，不能把旧调试路径恢复成运行依赖。
-- 没有推送、创建 PR、合并主分支或删除未合并工作区/分支。
+- 初次安装阶段未推送或合并主分支；后续 Git 集成按文末的新增授权进行。
+  未删除工作区或分支。
 
 本轮构建和签名命令（安装证据目录见上面的审查资源记录）：
 
@@ -93,3 +95,36 @@ codesign --verify --deep --strict "$HOME/Applications/iPhoneUse.app"
 
 其他格式、clippy、server/cache 测试的精确命令见
 [功能验收记录](../wifi-auto-reconnect.md#validation-commands)。
+
+## 后续 main 集成与双实例说明
+
+用户随后明确授权 merge & push。远端主线为 `33d4f1a`（0.28.1），功能分支
+为 `0448304`。在 `codex/wifi-main-integration` 上无冲突合并，合并提交为
+`14be631`；两条历史都被保留。目标为 `origin/main`，写入账号为仓库所属的
+`blairevan`。SSH 默认身份不同，因此仅本次 Git 命令使用 HTTPS / gh 凭据，
+不更改全局配置、不使用 force push。
+
+合并后局部 rustfmt、差异检查及 clippy 完成，server 测试 **1169 通过、
+2 跳过**。原有 clippy 警告保留，新增无线模块没有警告。
+
+```sh
+rustfmt --edition 2021 --check crates/server/src/wifi/*.rs crates/server/src/setup/wifi_flow.rs
+git diff HEAD^1 HEAD --check
+CARGO_BUILD_JOBS=2 cargo --config 'source.tuna.registry="sparse+https://rsproxy.cn/index/"' clippy --locked -p server --all-targets
+CARGO_BUILD_JOBS=2 cargo --config 'source.tuna.registry="sparse+https://rsproxy.cn/index/"' test --locked -p server --lib
+```
+
+只读核查发现两个独立实例，绑定不同手机：
+
+| 项目 | 默认实例 | i12 实例 |
+| --- | --- | --- |
+| App | `~/Applications/iPhoneUse.app` | `~/.iphone-use/instances/i12/runtime/iPhoneUse.app` |
+| 已安装版本 | 0.27.34 / build 999 | 0.27.34 / build 998 |
+| API 端口 | 44321 | 45710 |
+| Runner 端口 | 8100 | 8410 |
+| 新原生无线模块 | 支持 | 旧副本不支持 |
+
+核查时两个 daemon 都在运行并返回 HTTP 200，但两个手机控制 supervisor
+均未加载、released=true；i12 还带有 parked 标记。本轮只做 Git 集成和运行
+情况说明，不升级、删除或唤醒任一实例。Git 主线版本与已安装 App 版本分别
+记录，合并源码不等同于重装应用。Mac Shadowrocket 仍为 Connected。
