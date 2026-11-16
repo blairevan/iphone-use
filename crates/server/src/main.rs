@@ -161,6 +161,13 @@ struct Cli {
 enum Command {
     /// Start the daemon and browser/API server.
     Serve,
+    /// Receive an explicitly saved file through the Runner's native Files inbox.
+    /// Run after Save to Files completes. Use receive, status, stop or result.
+    #[command(disable_help_flag = true)]
+    Files {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     /// Stop a running daemon (best-effort; kills the recorded pid).
     ///
     /// An installed daemon runs as a launchd KeepAlive job, so launchd starts
@@ -520,8 +527,23 @@ fn instance_context() -> Result<()> {
         .ok()
         .filter(|value| !value.trim().is_empty());
     let state_dir_ok = instance.verify_on_disk().map_err(|error| error.to_string());
+    let daemon_plist = instance.home.join("Library/LaunchAgents").join(format!("{}.plist",instance.daemon_label));
+    let xcode = server::setup::ctx::choose_xcode(server::setup::ctx::XcodeInputs {
+        flag: std::env::var("IPHONE_USE_XCODE").ok().filter(|v| !v.is_empty()),
+        environment: std::env::var("DEVELOPER_DIR").ok().filter(|v| !v.is_empty()),
+        keepalive: std::env::var("IPU_RUNNER_KEEPALIVE").is_ok_and(|v| v == "1"),
+        remembered: server::setup::ctx::read_xcode_choice(&instance.state_dir),
+        supervisor_plist: server::setup::sys::plist_env(&instance.runner_plist(), "DEVELOPER_DIR"),
+        daemon_plist: server::setup::sys::plist_env(&daemon_plist, "DEVELOPER_DIR"),
+    });
+    let (developer_dir, developer_dir_error) = match xcode {
+        Ok((directory, _)) => (directory, None),
+        Err(error) => (None, Some(error)),
+    };
     let body = serde_json::json!({
         "schema_version": 1,
+        "developer_dir": developer_dir,
+        "developer_dir_error": developer_dir_error,
         "name": instance.name,
         "state_dir": instance.state_dir,
         "daemon_label": instance.daemon_label,
@@ -773,6 +795,7 @@ fn main() -> Result<()> {
     }
     let result = match command {
         Command::Serve => serve(),
+        Command::Files { args } => std::process::exit(server::file_handoff::main(&args)),
         Command::Stop => {
             let result = stop();
             // The daily "new version" line (stderr only). `serve` gets the same
@@ -1226,6 +1249,43 @@ fn run_server(cfg: Config, state: Arc<AppState>, runtime_dir: std::path::PathBuf
             &server::instance::current().state_dir,
             false,
         );
+
+        // Old runner launch logs in Xcode's DerivedData (#402) and the XCTest
+        // screen recordings older versions left on the phone (#415): cleared
+        // soon after start — an upgrade restarts the daemon, so what older
+        // versions left goes without waiting for a runner launch — then
+        // every 6 hours. The phone part needs a locally managed real device.
+        let attachments_udid = (state.managed_runner && state.simulator.is_none())
+            .then(|| state.device_udid.clone())
+            .flatten()
+            .filter(|udid| !udid.trim().is_empty());
+        if let Err(error) = std::thread::Builder::new()
+            .name("launch-log-sweep".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(90));
+                loop {
+                    let (removed, freed) = server::setup::runner::sweep_launch_logs_now();
+                    if removed > 0 {
+                        tracing::info!(
+                            "removed {removed} old device runner launch logs from Xcode DerivedData ({} MB)",
+                            freed / (1024 * 1024)
+                        );
+                    }
+                    if let Some(udid) = attachments_udid.as_deref() {
+                        let (emptied, freed) = server::setup::test_attachments::sweep(udid);
+                        if emptied > 0 {
+                            tracing::info!(
+                                "emptied {emptied} old XCTest attachments on the iPhone ({} MB)",
+                                freed / (1024 * 1024)
+                            );
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+                }
+            })
+        {
+            tracing::warn!("launch-log sweep not started: {error:#}");
+        }
 
         // Idle auto-release owns only the local supervisor. Remote runner
         // endpoints are externally managed and must never trigger local

@@ -110,6 +110,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Result<Arc<AppState>> {
         live_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         mjpeg_stream_activity: Arc::new(Mutex::new(std::collections::HashMap::new())),
         element_snapshots: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        action_traces: Arc::new(Mutex::new(crate::action_trace::TraceStore::default())),
         owner_snapshots: Arc::new(Mutex::new(std::collections::HashMap::new())),
         flow_trail: Arc::new(Mutex::new(crate::flows::FlowTrail::default())),
         agent_focus: Arc::new(Mutex::new(crate::focus::AgentFocus::load(
@@ -125,8 +126,53 @@ pub fn app_state(inputs: StateInputs<'_>) -> Result<Arc<AppState>> {
     }))
 }
 
+/// The host owns the control-file boundary; Runner Documents can be shared in Files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedHost {
+    App,
+    Runner,
+}
+
+/// Keep Runner control inputs private while preserving the App host's handoff path.
+fn embedded_control_dir(
+    host: EmbeddedHost,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    match host {
+        EmbeddedHost::App => home.join("Documents"),
+        EmbeddedHost::Runner => home.join("Library/Application Support/iphone-use/runner-control"),
+    }
+}
+
+/// Called before any Runner token or session secret is written.
+fn prepare_runner_storage(
+    home: &std::path::Path,
+    state_dir: &std::path::Path,
+    control_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let documents = home.join("Documents");
+    let documents = match std::fs::symlink_metadata(&documents) {
+        Ok(_) => documents.canonicalize()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => home.canonicalize()?.join("Documents"),
+        Err(error) => return Err(error),
+    };
+    if state_dir.canonicalize()?.starts_with(&documents) {
+        return Err(std::io::Error::other("Runner state is inside shared Documents"));
+    }
+    std::fs::create_dir_all(control_dir)?;
+    if std::fs::symlink_metadata(control_dir)?.file_type().is_symlink()
+        || control_dir.canonicalize()?.starts_with(&documents)
+    {
+        return Err(std::io::Error::other("Runner control directory is symlinked or inside shared Documents"));
+    }
+    std::fs::set_permissions(control_dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 /// How the device runner configures the daemon it hosts on the phone.
 pub struct EmbeddedOptions {
+    pub host_kind: EmbeddedHost,
     /// Address the daemon binds: the phone's own 127.0.0.1 unless a developer
     /// opens it up to reach it from a Mac (`/agent/*` still needs the token).
     pub host: String,
@@ -170,8 +216,15 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     instance
         .verify_on_disk()
         .map_err(|error| anyhow::anyhow!(error))?;
-    let documents =
-        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Documents"));
+    let home = std::env::var_os("HOME");
+    let documents = home.as_ref()
+        .map(|home| embedded_control_dir(options.host_kind, std::path::Path::new(home)));
+    if options.host_kind == EmbeddedHost::Runner {
+        let home = home.as_ref().context("HOME is not set for private Runner control")?;
+        let control = documents.as_ref().context("private Runner control directory missing")?;
+        prepare_runner_storage(std::path::Path::new(home), &instance.state_dir, control)
+            .context("Runner control storage must stay outside shared Documents")?;
+    }
     cfg.relay_url = relay_url(documents.as_deref());
     // A relay.json written by explicit setup is a saved remote opt-in. Pin it
     // for this process so routing, origin policy and TLS cannot drift apart.
@@ -205,9 +258,13 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     // so this works although the daemon is not LAN-reachable.
     let _ = EMBEDDED_PAIRING.set(state.pairing.clone());
     // A Mac connecting another phone over USB (`setup-app --connect-to`)
-    // drops a one-time code into Documents and reads back where we listen.
+    // drops a one-time code into its app container and reads back where we listen.
+    // Runner imports/exports stay outside shared Documents; old public files are
+    // never migrated into trusted control input. App-host handoff stays compatible.
     if let Some(documents) = &documents {
-        state.pairing.set_drop_file(documents.join("connect-code-import.json"));
+        state
+            .pairing
+            .set_drop_file(documents.join("connect-code-import.json"));
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -360,6 +417,16 @@ fn embedded_secret(state_dir: &std::path::Path) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runner_control_files_stay_outside_shared_documents() {
+        use super::{embedded_control_dir, EmbeddedHost};
+        let home = std::path::Path::new("/owned/app-container");
+        let runner = embedded_control_dir(EmbeddedHost::Runner, home);
+        assert!(!runner.starts_with(home.join("Documents")));
+        assert!(runner.starts_with(home.join("Library/Application Support")));
+        assert_eq!(embedded_control_dir(EmbeddedHost::App, home), home.join("Documents"));
+    }
+
     #[test]
     fn the_embedded_secret_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();

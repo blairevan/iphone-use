@@ -428,7 +428,7 @@ pub async fn layer(request: Request, next: Next) -> Response {
         .get::<axum::extract::MatchedPath>()
         .map(|matched| matched.as_str().to_string())
         .unwrap_or_else(|| "/agent/unknown".into());
-    if !path.starts_with("/agent/") || is_stream(&path) {
+    if (!path.starts_with("/agent/") && path != "/control") || is_stream(&path) {
         return next.run(request).await;
     }
     let started = Instant::now();
@@ -505,7 +505,7 @@ pub async fn layer(request: Request, next: Next) -> Response {
         tokio::task::spawn_blocking(move || append_log_line(line));
     }
     let status = response.status();
-    let (response, json) = attach(response, &summary).await;
+    let (response, json) = attach(response, &summary, matches!(path.as_str(), "/agent/input" | "/agent/actions" | "/control")).await;
     // Anonymous usage counts (off unless a token is configured; see
     // `telemetry`). A refused request is nobody's usage.
     if !matches!(status.as_u16(), 401 | 403 | 429) {
@@ -654,7 +654,7 @@ impl Summary {
 /// Add the timing header (and, for a JSON body that reached runner, the timing
 /// field), and hand back the parsed body for the task metrics. A body that
 /// is not JSON, too large, or of unknown size passes through unread.
-async fn attach(response: Response, summary: &Summary) -> (Response, Option<serde_json::Value>) {
+async fn attach(response: Response, summary: &Summary, feedback: bool) -> (Response, Option<serde_json::Value>) {
     let (mut parts, body) = response.into_parts();
     if let Ok(value) = HeaderValue::from_str(&summary.server_timing()) {
         parts.headers.insert("server-timing", value);
@@ -685,7 +685,15 @@ async fn attach(response: Response, summary: &Summary) -> (Response, Option<serd
             );
         }
     };
-    let json = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let mut json = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    if feedback {
+        if let Some(value) = json.as_mut().filter(|value| value.is_object()) {
+            crate::action_feedback::enrich(value);
+            if summary.calls > 0 { value["timing"] = summary.json(); }
+            parts.headers.remove(header::CONTENT_LENGTH);
+            return (Response::from_parts(parts, Body::from(value.to_string())), json);
+        }
+    }
     // A request that never reached runner keeps its body byte for byte; the
     // header still carries its total.
     if summary.calls == 0 {
@@ -999,7 +1007,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(big.clone()))
             .unwrap();
-        let (out, json) = attach(response, &summary).await;
+        let (out, json) = attach(response, &summary, false).await;
         assert!(json.is_none(), "an oversized body is passed through unread");
         assert_eq!(out.status(), axum::http::StatusCode::OK);
         assert!(out.headers().contains_key("server-timing"));
@@ -1019,7 +1027,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from_stream(stream))
             .unwrap();
-        let (out, _) = attach(response, &summary).await;
+        let (out, _) = attach(response, &summary, false).await;
         let body = axum::body::to_bytes(out.into_body(), usize::MAX)
             .await
             .unwrap();

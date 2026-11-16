@@ -938,7 +938,7 @@ final class KeepAwake {
   static let interval: TimeInterval = 10
   /// A beat runs on main between commands; one that takes this long would stall them, so beats
   /// stop for the rest of this runner's life.
-  static let slowBeat: TimeInterval = 2
+  static let slowBeat: TimeInterval = 10
 
   private let queue = DispatchQueue(label: "ipu.keepawake", qos: .utility)
   private let lock = NSLock()

@@ -32,11 +32,15 @@ curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure fo
    require `drivable:true`; otherwise pause those operations and follow the recovery steps below.
    Paired metadata reads (`phone_home_layout`, `phone_apps`) and cached capability
    discovery do not require a running Runner. Use them without reconnecting or
-   opening Home, and respect any private-hold refusal. Reconnect once
-   (`phone_reconnect`, with `wait_secs` to block until drivable or a blocker /
-   `POST /agent/mode {"mode":"agent"}`) only when the
-   user's current task needs the phone, never for a health check: each runner
-   launch can make the operator type the passcode. If `owner` is another
+   opening Home, and respect any private-hold refusal. A phone `released`
+   after the last task comes back by itself: the next MCP phone tool
+   (`phone_elements`, `phone_tap`, `phone_run_steps`, …) reconnects, waits, and
+   answers `phone_not_ready` with what to do when a person must act (enter the
+   passcode on the phone). Reconnect by hand once (`phone_reconnect`, with
+   `wait_secs` to block until drivable or a blocker / `POST /agent/mode
+   {"mode":"agent"}`) only when the user's current task needs the phone and no
+   tool brought it back, never for a health check: each runner launch can make
+   the operator type the passcode. If `owner` is another
    session, do not drive. → reference: *Phone states and recovery*
 
 2. **Look for a saved flow first.** Entering an app — a `launch_app` response,
@@ -83,7 +87,8 @@ curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure fo
    `phone_flow_publish(confirm=true)`. → reference: *Saving a flow*
 
 When the task is done, release the phone: `phone_release_owner` /
-`POST /agent/owner {"release":true}`. If a response carried `agent_focus`, the
+`POST /agent/owner {"release":true}`. That also stops the device runner right
+away, so the phone leaves automation mode until the next task needs it. If a response carried `agent_focus`, the
 phone is on Do Not Disturb for your session: tell the user, and releasing turns
 it off again.
 
@@ -318,3 +323,46 @@ When a task needs the complete value of one non-secure field, use
 completeness and UTF-16 limit. A truncated preview is not a full value; secure or
 unsupported fields require a permitted alternative. Ownership/privacy changes
 withhold results. This read does not focus, unlock, or claim control.
+
+### Native Files handoff (opt-in candidate)
+
+When an export needs an explicit file, check `iphone-use files --help`. With
+Runner Files enabled, use the source app's native Save to Files UI, finish the
+save into the Runner inbox, then receive that exact filename:
+
+```sh
+iphone-use files receive --device '<selected-udid>' --bundle '<installed-runner>.xctrunner' \
+  --instance '<selected-instance>' --owner '<your-existing-lease-owner>' \
+  --filename '<exact-saved-name>' --destination '<absolute-mac-folder>'
+```
+
+Use your own lease, the selected instance and verified bundle ID. This command
+does not acquire someone else's control or establish that a source writer has
+finished. Its current checks require a wired connection but do not lock the
+transport. Confirm `committed:true`; retain the transfer ID and digest. After
+interruption, use `iphone-use files result` with the same device, bundle,
+instance, state directory and transfer ID. An unknown outcome requires
+inspection before another receive. `files stop` requests receiver cancellation.
+The receiver remains a candidate with documented checkpoint and upgrade gaps.
+
+## Focused observation and action receipts
+
+`phone_subtree(element, snapshot)` reads a unique native element's descendants.
+Read `complete`/`coverage`; its local row positions are read-only and cannot be
+used as action refs. Use locators or fresh `phone_elements` refs for input.
+Older runners explicitly refuse this operation.
+
+`action_evidence` separates delivery from postcondition verification. A native
+ACK is not application success; even verified element values do not establish
+saving or submission. Errors carry `recovery.action.next_step` and
+`retry_allowed`. Never replay partial or uncertain requests.
+
+For delayed loaders use `expect.absent_after_present:true` with `absent` or
+`ocr_absent`: every target must appear during this wait before absence counts.
+A loader never observed causes timeout; ordinary absence checks omit the flag.
+
+`phone_run_start(trace=true)` enables a redacted, owner-scoped timeline for this
+run. Read it with `phone_run_trace(run_id)` and close with `phone_run_end`.
+It is bounded memory, lost on restart, and contains no input values, labels,
+URLs or screenshots. It supports inspection, never automatic action replay.
+Native per-element enabled/editable/frame checks require an updated runner.

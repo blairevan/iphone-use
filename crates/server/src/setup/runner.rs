@@ -58,19 +58,320 @@ pub fn xcodebuild_args(ctx: &Ctx, args: &[String]) -> Result<Vec<String>, String
     Ok(out)
 }
 
+/// Turns off xcodebuild's diagnostics collection for the runner's test (#402).
+/// By default a failed test session makes xcodebuild run `devicectl diagnose`:
+/// a full sysdiagnose of the iPhone and of the Mac (~0.9 GB together, several
+/// minutes), saved into a fresh DerivedData result bundle. The runner's test
+/// never passes — it serves until it is stopped — and a supervisor relaunching
+/// a failing runner repeats that every round: one Mac here held 583 such
+/// bundles (10 GB), 13 of them with an iPhone sysdiagnose.
+pub const NO_TEST_DIAGNOSTICS: [&str; 2] = ["-collect-test-diagnostics", "never"];
+
+/// Whether this xcodebuild's `-help` lists `-collect-test-diagnostics`
+/// (older Xcodes refuse unknown options, so the flag is only passed when it is).
+pub fn supports_no_test_diagnostics(help: &str) -> bool {
+    help.contains(NO_TEST_DIAGNOSTICS[0])
+}
+
+/// What the runner's `.xctestrun` must say so XCTest records nothing on the
+/// phone (#402). Since Xcode 15 a UI test screen-records the whole session by
+/// default (`PreferredScreenCaptureFormat = screenRecording`) and keeps the
+/// recording unless the test passes (`deleteOnSuccess`). The runner's test
+/// never passes — it serves until it is stopped — and the recording waits on
+/// the phone for a transfer that never comes: measured on an iPhone 13,
+/// about 2 MB/s of driving gone from free space and not given back when the
+/// runner stops, counted under iOS "System Data". A reporter's phone held
+/// 94 GB of it.
+pub const NO_TEST_RECORDING: [(&str, &str); 3] = [
+    ("PreferredScreenCaptureFormat", "screenshots"),
+    ("SystemAttachmentLifetime", "keepNever"),
+    ("UserAttachmentLifetime", "keepNever"),
+];
+
+/// Xcode's own values for the same keys, restored for a launch with
+/// `IPU_RUNNER_TEST_DIAGNOSTICS=1` (the cached `.xctestrun` keeps whatever
+/// the last launch wrote).
+pub const XCODE_TEST_RECORDING: [(&str, &str); 3] = [
+    ("PreferredScreenCaptureFormat", "screenRecording"),
+    ("SystemAttachmentLifetime", "deleteOnSuccess"),
+    ("UserAttachmentLifetime", "deleteOnSuccess"),
+];
+
+/// Rewrites `xctestrun` so the runner's test records no screen and keeps no
+/// attachments ([`NO_TEST_RECORDING`]). Handles both the format-1 layout
+/// (one dict per test target at the top) and format 2
+/// (`TestConfigurations[].TestTargets[]`). Writes only when something changes,
+/// through a temporary file in the same directory. Returns whether it wrote.
+pub fn disable_test_recording(xctestrun: &Path) -> Result<bool, String> {
+    set_test_recording(xctestrun, &NO_TEST_RECORDING)
+}
+
+/// Writes `values` into every test target of `xctestrun`; see
+/// [`disable_test_recording`].
+pub fn set_test_recording(xctestrun: &Path, values: &[(&str, &str); 3]) -> Result<bool, String> {
+    let mut value = plist::Value::from_file(xctestrun).map_err(|e| format!("could not read {}: {e}", xctestrun.display()))?;
+    let Some(root) = value.as_dictionary_mut() else {
+        return Err(format!("{} is not a dictionary", xctestrun.display()));
+    };
+    let mut changed = false;
+    let mut apply = |target: &mut plist::Dictionary| {
+        for &(key, want) in values {
+            if target.get(key).and_then(plist::Value::as_string) != Some(want) {
+                target.insert(key.to_string(), plist::Value::String(want.to_string()));
+                changed = true;
+            }
+        }
+    };
+    for (key, entry) in root.iter_mut() {
+        if key == "__xctestrun_metadata__" {
+            continue;
+        }
+        if key == "TestConfigurations" {
+            for config in entry.as_array_mut().into_iter().flatten() {
+                let targets = config.as_dictionary_mut().and_then(|c| c.get_mut("TestTargets")).and_then(plist::Value::as_array_mut);
+                for target in targets.into_iter().flatten() {
+                    if let Some(target) = target.as_dictionary_mut() {
+                        apply(target);
+                    }
+                }
+            }
+        } else if let Some(target) = entry.as_dictionary_mut() {
+            if target.contains_key("TestBundlePath") || target.contains_key("TestHostPath") {
+                apply(target);
+            }
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let dir = xctestrun.parent().ok_or("the .xctestrun has no directory")?;
+    let temp = dir.join(format!(".ipu-xctestrun-{}.tmp", std::process::id()));
+    let written = value.to_file_xml(&temp).map_err(|e| e.to_string()).and_then(|()| std::fs::rename(&temp, xctestrun).map_err(|e| e.to_string()));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("could not update {}: {error}", xctestrun.display()));
+    }
+    Ok(true)
+}
+
+/// `IPU_RUNNER_TEST_DIAGNOSTICS=1` keeps xcodebuild's diagnostics collection,
+/// for debugging a runner that will not start.
+pub fn test_diagnostics_wanted() -> bool {
+    std::env::var("IPU_RUNNER_TEST_DIAGNOSTICS").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Result-log directories `test-without-building` leaves in Xcode's
+/// DerivedData (`IPhoneUseRunner-<hash>/Logs/Test/*.xcresult`), one per
+/// launch, never cleaned (#402: 898 of them, 11 GB on one Mac). Removes the
+/// ones that hold nothing but such logs and have not changed for `idle`,
+/// keeping the newest `keep`. A directory with anything else in it — a build
+/// of the runner project opened in Xcode — is never touched.
+/// A directory touched at or after `busy_since` (the start of the oldest
+/// xcodebuild still running) may belong to a live launch and stays too.
+/// Returns (removed, bytes freed).
+pub fn sweep_runner_launch_logs(
+    derived_data: &Path,
+    idle: std::time::Duration,
+    keep: usize,
+    busy_since: Option<std::time::SystemTime>,
+) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(derived_data) else { return (0, 0) };
+    let now = std::time::SystemTime::now();
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("IPhoneUseRunner-"))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .filter(|dir| only_runner_launch_logs(dir))
+        .filter_map(|dir| Some((newest_mtime(&dir)?, dir)))
+        .collect();
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    let mut removed = 0;
+    let mut freed = 0;
+    for (modified, dir) in candidates.into_iter().skip(keep) {
+        if now.duration_since(modified).unwrap_or_default() < idle || busy_since.is_some_and(|t| modified >= t) {
+            continue;
+        }
+        let bytes = tree_bytes(&dir);
+        if std::fs::remove_dir_all(&dir).is_ok() {
+            removed += 1;
+            freed += bytes;
+        }
+    }
+    (removed, freed)
+}
+
+/// Sweeps the current user's DerivedData (see [`sweep_runner_launch_logs`]):
+/// before each runner launch, when the daemon starts — so an upgrade clears
+/// what older versions left without waiting for a launch — and every few
+/// hours while it runs. Launch logs of any xcodebuild still running are left
+/// alone. Returns (removed, bytes freed).
+pub fn sweep_launch_logs_now() -> (usize, u64) {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else { return (0, 0) };
+    let derived = Path::new(&home).join("Library/Developer/Xcode/DerivedData");
+    if !derived.is_dir() {
+        return (0, 0);
+    }
+    // Without the process list a running xcodebuild cannot be ruled out.
+    let Some(ps) = ps_elapsed_commands() else { return (0, 0) };
+    let busy_since = oldest_xcodebuild_start(&ps);
+    sweep_runner_launch_logs(&derived, std::time::Duration::from_secs(600), 3, busy_since)
+}
+
+/// `ps -o etime=,command=` for this user's processes: elapsed time and
+/// command line. `None` when `ps` cannot run or fails.
+fn ps_elapsed_commands() -> Option<String> {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() }.to_string();
+    let out = std::process::Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-xww", "-U", uid.as_str(), "-o", "etime=,command="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// When the oldest running xcodebuild started (a minute early, for clock and
+/// ps rounding), from `ps -o etime=,command=` output. `None` when none runs.
+fn oldest_xcodebuild_start(ps: &str) -> Option<std::time::SystemTime> {
+    let oldest = ps
+        .lines()
+        .filter_map(|line| {
+            let (etime, command) = line.trim_start().split_once(char::is_whitespace)?;
+            runs_xcodebuild(command.trim_start()).then(|| parse_etime(etime))?
+        })
+        .max()?;
+    std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(oldest + 60))
+}
+
+/// The command's program is `xcodebuild`. The path may hold spaces
+/// (`/Applications/Xcode 16.app/…/xcodebuild`), so the program is everything
+/// up to the first `xcodebuild` that starts the line or follows a `/` and is
+/// followed by a space or the end.
+fn runs_xcodebuild(command: &str) -> bool {
+    command.match_indices("xcodebuild").any(|(i, word)| {
+        let before = &command[..i];
+        let after = &command[i + word.len()..];
+        (before.is_empty() || (before.ends_with('/') && !before.contains(" -")))
+            && (after.is_empty() || after.starts_with(char::is_whitespace))
+    })
+}
+
+/// `ps` etime, `[[dd-]hh:]mm:ss`, in seconds.
+fn parse_etime(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, etime),
+    };
+    let mut secs = 0u64;
+    let parts: Vec<&str> = clock.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    for part in parts {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
+/// `dir` holds only `Logs/` (and older Xcodes' `TestResults/metadata.db`);
+/// `Logs` holds `Test` plus the empty `Build`,
+/// `Launch`, `Package`… folders xcodebuild creates for every action; and
+/// `Logs/Test` only the runner's result bundles
+/// (`Test-IPhoneUseRunner-*.xcresult`) and their bookkeeping. A build of the
+/// project fills `Logs/Build` (`.xcactivitylog`), so such a directory stays.
+fn only_runner_launch_logs(dir: &Path) -> bool {
+    let names = |path: &Path| -> Option<Vec<String>> {
+        Some(std::fs::read_dir(path).ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+    };
+    let Some(top) = names(dir) else { return false };
+    let test_results_only_index = || {
+        std::fs::read_dir(dir.join("TestResults")).is_ok_and(|entries| {
+            entries.flatten().all(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name == ".DS_Store" || (name.starts_with("metadata.db") && e.file_type().is_ok_and(|t| t.is_file()))
+            })
+        })
+    };
+    if top.iter().any(|name| match name.as_str() {
+        "Logs" | ".DS_Store" => false,
+        "TestResults" => !test_results_only_index(),
+        _ => true,
+    }) || !top.iter().any(|n| n == "Logs")
+    {
+        return false;
+    }
+    let logs = dir.join("Logs");
+    let Some(kinds) = names(&logs) else { return false };
+    let empty_or_finder = |name: &String| {
+        names(&logs.join(name)).is_some_and(|inner| inner.iter().all(|n| n == ".DS_Store"))
+    };
+    if !kinds.iter().all(|name| name == "Test" || name == ".DS_Store" || empty_or_finder(name)) {
+        return false;
+    }
+    let tests = names(&dir.join("Logs").join("Test")).unwrap_or_default();
+    tests.iter().all(|name| {
+        name.starts_with("Test-IPhoneUseRunner-") || name == "LogStoreManifest.plist" || name == ".DS_Store"
+    })
+}
+
+/// Newest modification time in the tree; `DirEntry::metadata` does not follow
+/// symlinks, so a link out of the directory is never walked.
+fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = std::fs::symlink_metadata(dir).ok()?.modified().ok()?;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if let Ok(modified) = meta.modified() {
+                newest = newest.max(modified);
+            }
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Some(newest)
+}
+
+fn tree_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 /// The launch argv; also the runner's PID identity (see pid.rs).
-pub fn runner_argv(ctx: &Ctx, udid: &str, xctestrun: &Path) -> Result<Vec<String>, String> {
-    xcodebuild_args(
-        ctx,
-        &[
-            "-destination".into(),
-            format!("platform=iOS,id={udid}"),
-            "test-without-building".into(),
-            "-xctestrun".into(),
-            xctestrun.to_string_lossy().into_owned(),
-            format!("-only-testing:{RUNNER_TEST_ID}"),
-        ],
-    )
+/// `no_diagnostics` adds [`NO_TEST_DIAGNOSTICS`].
+pub fn runner_argv(
+    ctx: &Ctx,
+    udid: &str,
+    xctestrun: &Path,
+    no_diagnostics: bool,
+) -> Result<Vec<String>, String> {
+    let mut args = vec![
+        "-destination".into(),
+        format!("platform=iOS,id={udid}"),
+        "test-without-building".into(),
+        "-xctestrun".into(),
+        xctestrun.to_string_lossy().into_owned(),
+        format!("-only-testing:{RUNNER_TEST_ID}"),
+    ];
+    if no_diagnostics {
+        args.extend(NO_TEST_DIAGNOSTICS.map(String::from));
+    }
+    xcodebuild_args(ctx, &args)
 }
 
 /// Every build-time xcodebuild of the runner project.
@@ -229,6 +530,17 @@ pub fn log_shows_automation_revoked(path: &Path, from: u64) -> bool {
     read_log_since(path, from).contains("Not authorized for performing UI testing actions")
 }
 
+/// The test process ended under iOS without the person: xcodebuild's
+/// "Restarting after unexpected exit, crash, or test timeout" (#413: a
+/// watchdog kill on a heavy accessibility tree), logged after `from`.
+/// xcodebuild restarts the test in the same launch, so only the last restart
+/// counts, and only when the runner did not serve again after it.
+pub fn log_shows_runner_crash(path: &Path, from: u64) -> bool {
+    let log = read_log_since(path, from);
+    log.rfind("Restarting after unexpected exit, crash, or test timeout")
+        .is_some_and(|at| !log[at..].contains("ServerURLHere->"))
+}
+
 fn read_log_since(path: &Path, from: u64) -> String {
     use std::io::{Read as _, Seek as _};
     let Ok(mut file) = std::fs::File::open(path) else { return String::new(); };
@@ -243,6 +555,42 @@ fn read_log_since(path: &Path, from: u64) -> String {
 /// The log's current length, the `from` for [`log_shows_automation_revoked`].
 pub fn log_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// The phone has no room for the runner app: MobileInstallation's
+/// `Insufficient storage. Requires N bytes; only M bytes available` (#402,
+/// a phone whose System Data filled the disk). The product is fine; only
+/// space on the phone fixes it, so this is checked before the product
+/// failure that would evict it and rebuild every round.
+pub fn log_shows_storage_full(path: &Path) -> bool {
+    storage_full_line(&read_log(path)).is_some()
+}
+
+fn storage_full_line(text: &str) -> Option<&str> {
+    text.lines().find(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("insufficient storage") || lower.contains("not enough storage")
+    })
+}
+
+/// (bytes required, bytes available) from that line, when it names them.
+pub fn storage_full_bytes(path: &Path) -> (Option<u64>, Option<u64>) {
+    let text = read_log(path);
+    let Some(line) = storage_full_line(&text) else { return (None, None) };
+    let lower = line.to_lowercase();
+    let required = lower.find("requires ").and_then(|at| {
+        let digits: String = lower[at + "requires ".len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    });
+    let available = lower.find(" bytes available").and_then(|at| {
+        let head = &lower[..at];
+        let start = head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        head[start..].parse().ok()
+    });
+    (required, available)
 }
 
 /// A failure of the product itself (install/launch/signing), the only kind
@@ -903,6 +1251,190 @@ pub fn prepare_xcconfig(ctx: &Ctx) -> Result<(String, Option<PathBuf>), String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sweeps_only_runner_launch_logs_and_keeps_the_newest() {
+        let root = tempfile::tempdir().unwrap();
+        let make = |name: &str, extra: Option<&str>| {
+            let test = root.path().join(name).join("Logs/Test");
+            let bundle = test.join("Test-IPhoneUseRunner-2026.11.04_15-54-45-+0900.xcresult/Data");
+            std::fs::create_dir_all(&bundle).unwrap();
+            std::fs::write(bundle.join("blob"), vec![0u8; 1000]).unwrap();
+            std::fs::write(test.join("LogStoreManifest.plist"), b"x").unwrap();
+            if let Some(extra) = extra {
+                std::fs::create_dir_all(root.path().join(name).join(extra)).unwrap();
+            }
+        };
+        for n in 0..5 {
+            make(&format!("IPhoneUseRunner-launch{n}"), None);
+        }
+        make("IPhoneUseRunner-opened-in-xcode", Some("Build"));
+        // xcodebuild's empty per-action folders do not make a directory a build…
+        make("IPhoneUseRunner-launch-with-empty-logs", Some("Logs/Build"));
+        // …but a build log does.
+        make("IPhoneUseRunner-built", Some("Logs/Build"));
+        std::fs::write(root.path().join("IPhoneUseRunner-built/Logs/Build/x.xcactivitylog"), b"log").unwrap();
+        make("SomeOtherApp-abc", None);
+        // Nothing idle long enough yet: a launch in progress is never removed.
+        assert_eq!(sweep_runner_launch_logs(root.path(), std::time::Duration::from_secs(600), 3, None), (0, 0));
+        let (removed, freed) = sweep_runner_launch_logs(root.path(), std::time::Duration::ZERO, 3, None);
+        assert_eq!(removed, 3, "six launch dirs, three kept");
+        assert!(freed >= 2000);
+        let left: Vec<String> = std::fs::read_dir(root.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.contains(&"IPhoneUseRunner-opened-in-xcode".to_string()), "a project build is not ours to clean");
+        assert!(left.contains(&"IPhoneUseRunner-built".to_string()), "Logs/Build with a build log is not ours to clean");
+        assert!(left.contains(&"SomeOtherApp-abc".to_string()));
+        assert_eq!(left.iter().filter(|n| n.starts_with("IPhoneUseRunner-launch")).count(), 3);
+        assert_eq!(sweep_runner_launch_logs(&root.path().join("missing"), std::time::Duration::ZERO, 0, None), (0, 0));
+    }
+
+    #[test]
+    fn sweep_spares_launches_of_a_running_xcodebuild_and_takes_old_test_results() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["IPhoneUseRunner-old", "IPhoneUseRunner-live"] {
+            let test = root.path().join(name).join("Logs/Test");
+            std::fs::create_dir_all(&test).unwrap();
+            std::fs::write(test.join("LogStoreManifest.plist"), b"x").unwrap();
+        }
+        let results = root.path().join("IPhoneUseRunner-old/TestResults");
+        std::fs::create_dir_all(&results).unwrap();
+        std::fs::write(results.join("metadata.db"), b"x").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for file in ["IPhoneUseRunner-old/Logs/Test/LogStoreManifest.plist", "IPhoneUseRunner-old/TestResults/metadata.db"] {
+            std::fs::File::options().write(true).open(root.path().join(file)).unwrap().set_modified(old).unwrap();
+        }
+        for dir in ["IPhoneUseRunner-old/Logs/Test", "IPhoneUseRunner-old/Logs", "IPhoneUseRunner-old/TestResults", "IPhoneUseRunner-old"] {
+            std::fs::File::open(root.path().join(dir)).unwrap().set_modified(old).unwrap();
+        }
+        let busy = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(3600));
+        let (removed, _) = sweep_runner_launch_logs(root.path(), std::time::Duration::ZERO, 0, busy);
+        assert_eq!(removed, 1);
+        assert!(!root.path().join("IPhoneUseRunner-old").exists(), "TestResults with only its index is a launch leftover");
+        assert!(root.path().join("IPhoneUseRunner-live").exists(), "a running xcodebuild's launch stays");
+        // Something else in TestResults is not ours.
+        let other = root.path().join("IPhoneUseRunner-other");
+        std::fs::create_dir_all(other.join("Logs/Test")).unwrap();
+        std::fs::create_dir_all(other.join("TestResults/Attachments")).unwrap();
+        assert!(!only_runner_launch_logs(&other));
+        // Nor is a directory that merely carries the index's name.
+        let named = root.path().join("IPhoneUseRunner-named");
+        std::fs::create_dir_all(named.join("Logs/Test")).unwrap();
+        std::fs::create_dir_all(named.join("TestResults/metadata.db-dir")).unwrap();
+        assert!(!only_runner_launch_logs(&named));
+    }
+
+    #[test]
+    fn oldest_xcodebuild_start_reads_ps_etime() {
+        assert_eq!(parse_etime("05:07"), Some(307));
+        assert_eq!(parse_etime("01:00:00"), Some(3600));
+        assert_eq!(parse_etime("2-01:00:00"), Some(2 * 86_400 + 3600));
+        assert_eq!(parse_etime("garbage"), None);
+        let ps = "  10:00 /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -destination x test-without-building\n\
+                  1-00:00:00 /usr/bin/xcodebuild-helper\n\
+                  20:00 /bin/zsh -c xcodebuild\n\
+                  00:30 xcodebuild build\n";
+        let since = oldest_xcodebuild_start(ps).unwrap();
+        let ago = std::time::SystemTime::now().duration_since(since).unwrap().as_secs();
+        assert!((659..=662).contains(&ago), "oldest is the 10-minute xcodebuild plus a minute: {ago}");
+        assert_eq!(oldest_xcodebuild_start("  00:01 /bin/sleep 5\n"), None);
+        assert!(runs_xcodebuild("/Applications/Xcode 16.app/Contents/Developer/usr/bin/xcodebuild -destination x"));
+        assert!(runs_xcodebuild("xcodebuild"));
+        assert!(!runs_xcodebuild("/bin/zsh -c xcodebuild"));
+        assert!(!runs_xcodebuild("/usr/bin/grep -e /xcodebuild x"));
+        assert!(!runs_xcodebuild("/usr/bin/xcodebuild-helper"));
+    }
+
+    fn xctestrun_with(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("IPhoneUseRunner_iphoneos27.2-arm64.xctestrun");
+        std::fs::write(
+            &path,
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>{body}
+<key>__xctestrun_metadata__</key><dict><key>FormatVersion</key><integer>1</integer></dict>
+</dict></plist>"#),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn target_keys(value: &plist::Dictionary) -> Vec<(String, String)> {
+        super::NO_TEST_RECORDING
+            .iter()
+            .map(|(k, _)| (k.to_string(), value.get(k).and_then(plist::Value::as_string).unwrap_or("").to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn xctestrun_stops_screen_recording_in_both_formats() {
+        let want: Vec<(String, String)> = super::NO_TEST_RECORDING.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        // Format 1: what Xcode 26/27 builds for the runner today.
+        let (_d, path) = xctestrun_with(
+            "<key>IPhoneUseRunnerUITests</key><dict><key>TestBundlePath</key><string>x</string>\
+             <key>PreferredScreenCaptureFormat</key><string>screenRecording</string>\
+             <key>SystemAttachmentLifetime</key><string>deleteOnSuccess</string>\
+             <key>UserAttachmentLifetime</key><string>deleteOnSuccess</string></dict>",
+        );
+        assert_eq!(super::disable_test_recording(&path), Ok(true));
+        let value = plist::Value::from_file(&path).unwrap();
+        let root = value.as_dictionary().unwrap();
+        assert_eq!(target_keys(root["IPhoneUseRunnerUITests"].as_dictionary().unwrap()), want);
+        assert!(root.contains_key("__xctestrun_metadata__"), "metadata kept");
+        assert_eq!(super::disable_test_recording(&path), Ok(false), "already right: no rewrite");
+        // Format 2.
+        let (_d2, path2) = xctestrun_with(
+            "<key>TestConfigurations</key><array><dict><key>TestTargets</key><array><dict>\
+             <key>BlueprintName</key><string>IPhoneUseRunnerUITests</string>\
+             <key>PreferredScreenCaptureFormat</key><string>screenRecording</string></dict></array></dict></array>",
+        );
+        assert_eq!(super::disable_test_recording(&path2), Ok(true));
+        let value = plist::Value::from_file(&path2).unwrap();
+        let target = value.as_dictionary().unwrap()["TestConfigurations"].as_array().unwrap()[0].as_dictionary().unwrap()["TestTargets"]
+            .as_array()
+            .unwrap()[0]
+            .as_dictionary()
+            .unwrap()
+            .clone();
+        assert_eq!(target_keys(&target), want);
+        // A diagnostics launch puts Xcode's values back.
+        assert_eq!(super::set_test_recording(&path2, &super::XCODE_TEST_RECORDING), Ok(true));
+        let value = plist::Value::from_file(&path2).unwrap();
+        let format = value.as_dictionary().unwrap()["TestConfigurations"].as_array().unwrap()[0].as_dictionary().unwrap()["TestTargets"]
+            .as_array()
+            .unwrap()[0]
+            .as_dictionary()
+            .unwrap()["PreferredScreenCaptureFormat"]
+            .as_string()
+            .map(str::to_string);
+        assert_eq!(format.as_deref(), Some("screenRecording"));
+        assert!(super::disable_test_recording(&path2.with_extension("missing")).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(path2.parent().unwrap()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn a_full_phone_is_told_apart_from_a_broken_product() {
+        let full = log("2026-11-05 11:02:03.1+0800 xcodebuild[1:2] Failed to install the app on the device. (MIInstallerErrorDomain error 4: Insufficient storage. Requires 52887552 bytes; only 756000 bytes available.)\n");
+        assert!(log_shows_storage_full(full.path()));
+        // Still a product-level failure by the old test, which is why the
+        // storage check has to come first.
+        assert!(log_shows_product_failure(full.path()));
+        assert_eq!(storage_full_bytes(full.path()), (Some(52_887_552), Some(756_000)));
+        let bare = log("Error: Not enough storage is available on the device\n");
+        assert!(log_shows_storage_full(bare.path()));
+        assert_eq!(storage_full_bytes(bare.path()), (None, None));
+        let broken = log("Failed to install the app on the device. (0xe8008001)\n");
+        assert!(!log_shows_storage_full(broken.path()));
+        // A full Mac disk is not the phone's storage.
+        assert!(!log_shows_storage_full(log("error: No space left on device\n").path()));
+    }
+
+    #[test]
+    fn runner_launch_turns_diagnostics_off_only_when_xcodebuild_has_the_flag() {
+        assert!(supports_no_test_diagnostics("    -collect-test-diagnostics on-failure|never   Whether or not testing collects"));
+        assert!(!supports_no_test_diagnostics("usage: xcodebuild [-project <projectname>]"));
+    }
+
     use super::*;
 
     #[test]
@@ -917,6 +1449,26 @@ mod tests {
         assert!(!log_shows_connection_invalidated(file.path(), mark));
         std::fs::write(file.path(), old).unwrap();
         assert!(log_shows_connection_invalidated(file.path(), mark + 100));
+    }
+
+    #[test]
+    fn a_watchdog_restart_in_the_current_window_reads_as_a_crash() {
+        // #413: the runner vanished between two polls; xcodebuild says why.
+        let old = "13:32:21.098  ipu-runner: GET /wda/locked -> 200 (1.2 ms)\n";
+        let crash = "Restarting after unexpected exit, crash, or test timeout; summary will include totals from previous launches.\n";
+        let file = log(&format!("{crash}{old}"));
+        let mark = (crash.len() + old.len()) as u64;
+        assert!(log_shows_runner_crash(file.path(), 0));
+        assert!(!log_shows_runner_crash(file.path(), mark));
+        std::fs::write(file.path(), format!("{crash}{old}{crash}")).unwrap();
+        assert!(log_shows_runner_crash(file.path(), mark));
+        assert!(!log_shows_automation_revoked(file.path(), mark));
+        // A restart the runner came back from is not why it ended later.
+        let served = "ServerURLHere->http://10.0.0.2:8100<-ServerURLHere\n";
+        std::fs::write(file.path(), format!("{crash}{old}{crash}{served}")).unwrap();
+        assert!(!log_shows_runner_crash(file.path(), mark));
+        std::fs::write(file.path(), format!("{crash}{old}{crash}{served}{crash}")).unwrap();
+        assert!(log_shows_runner_crash(file.path(), mark));
     }
 
     #[test]

@@ -189,6 +189,18 @@ pub struct ElementsParams {
     pub ocr: Option<String>,
 }
 
+/// One snapshot-selected native subtree, read without a global tree walk.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubtreeParams {
+    pub snapshot: String,
+    pub element: usize,
+    /// Relative depth cap (1..64), default 8.
+    pub max_depth: Option<u32>,
+    /// Node cap (1..5000), default 500.
+    pub max_nodes: Option<u32>,
+}
+
 /// Parameters for [`phone_tap_label`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -554,6 +566,10 @@ pub struct PhoneUiExpectation {
     /// Text that must not be visible (a loading caption), read by OCR.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ocr_absent: Vec<String>,
+    /// Wait until each absent target has first appeared and then disappeared;
+    /// use for loaders that may start after the preceding action returns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absent_after_present: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -739,6 +755,12 @@ pub struct PhoneHandler {
     /// once at start.
     profile: std::sync::Arc<ToolProfile>,
     instances: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, PhoneHandler>>>,
+    /// When this session last saw the phone usable (a status that said so,
+    /// or a phone tool that succeeded). Within [`RECONNECT_CHECK_FRESH`] the
+    /// on-use reconnect skips its status read: the phone was driven too
+    /// recently for the idle release, and this session's own task end
+    /// clears it.
+    usable_seen: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Parameters for [`PhoneHandler::phone_login`].
@@ -793,6 +815,7 @@ fn reconnect_brief(status: &crate::types::StatusResponse) -> serde_json::Value {
         "setup_phase": status.setup_phase,
         "setup_message": status.setup_message,
         "setup_blocked_on": status.setup_blocked_on,
+        "setup_retry": status.extra.get("setup_retry"),
         "hint": status.hint,
     })
 }
@@ -820,15 +843,164 @@ fn reconnect_wait_outcome(status: &crate::types::StatusResponse) -> Option<&'sta
 /// before the tunnel comes up and the runner build starts.
 const RECONNECT_BLOCKER_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Whether a blocker seen for `held` should end the wait now.
+/// A scheduled retry further out than this ends the wait as `blocked`.
+const RECONNECT_RETRY_SOON_SECS: u64 = 60;
+
+/// The supervisor's scheduled automatic retry after a failed setup round, as
+/// (attempt, seconds until it runs) from the daemon's `setup_retry`.
+fn reconnect_setup_retry(status: &crate::types::StatusResponse) -> Option<(u64, u64)> {
+    let retry = status.extra.get("setup_retry")?;
+    Some((retry.get("attempt")?.as_u64()?, retry.get("next_in_secs")?.as_u64()?))
+}
+
+/// Tools that need the phone itself. Before one runs on a phone released
+/// after the last task, the MCP server brings it back (the AI really needs it
+/// now) instead of returning the daemon's `released` refusal for the model to
+/// work around. Status, inventory, flow files, holds, metrics, logs, the
+/// person's live panel and the device-service calls that need no runner
+/// (home layout, apps, install, location) never wake a phone.
+const RECONNECT_ON_USE_TOOLS: &[&str] = &[
+    "phone_screenshot", "phone_tap", "phone_scroll", "phone_type", "phone_key", "phone_shortcut",
+    "phone_run_steps", "phone_read_value", "phone_subtree", "phone_elements", "phone_tap_element",
+    "phone_tap_label", "phone_collect_list", "phone_scroll_find", "phone_login", "phone_flow_run",
+    "phone_jev_run", "phone_record",
+];
+
+/// How long a tool call waits for the phone it brings back. A cached runner
+/// starts in ~13 s; a rebuild after an upgrade takes 1–2 min.
+const RECONNECT_ON_USE_BUDGET: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// See [`PhoneHandler::usable_seen`]. Well under the idle window (300 s).
+const RECONNECT_CHECK_FRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn reconnect_on_use(tool: &str, args: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
+    let arg = |key: &str| args.and_then(|args| args.get(key)).and_then(serde_json::Value::as_str);
+    let needs_phone = match tool {
+        // Only a start needs the runner; status and stop read the recorder.
+        "phone_record" => arg("action") == Some("start"),
+        // A bad id is refused before anything reaches the phone; do not
+        // make the caller wait for (or type a passcode for) a reconnect first.
+        "phone_flow_run" => arg("id").is_some_and(|id| {
+            id.ends_with(".json") || crate::registry::valid_flow_id(id)
+        }),
+        _ => RECONNECT_ON_USE_TOOLS.contains(&tool),
+    };
+    needs_phone && std::env::var("IPHONE_USE_MCP_RECONNECT_ON_USE").map_or(true, |v| v.trim() != "0")
+}
+
+/// Whether a tool result is the daemon refusing because the phone is
+/// released or coming back: the next call must check status again.
+fn refused_as_released(result: &CallToolResult) -> bool {
+    result.content.iter().filter_map(|c| c.as_text()).any(|t| {
+        ["\"released\"", "\"reconnect_in_progress\"", "\"reconnecting\"", "\"releasing\""]
+            .iter()
+            .any(|needle| t.text.contains(&format!("\"error\":{needle}")))
+    })
+}
+
+/// Whether this status is a phone the MCP server may bring back for a tool
+/// call: released (or already coming back) by this daemon, with nothing a
+/// person decided in the way — a hand-off, a session ended on the phone, a
+/// parked runner, a blocker, another session's lease.
+fn may_reconnect_for_use(status: &crate::types::StatusResponse, me: &str) -> bool {
+    let flag = |key: &str| status.extra.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    status.drivable != Some(true)
+        && (status.released == Some(true) || status.reconnecting == Some(true))
+        && status.recovery_owner.as_deref() == Some("daemon")
+        && !flag("human_handoff")
+        && !flag("ended_on_phone")
+        && !flag("runner_parked")
+        && status.releasing != Some(true)
+        // A private hold refuses screen reads anyway; do not start the runner for one.
+        && status.extra.get("screen_private_secs").and_then(serde_json::Value::as_u64).unwrap_or(0) == 0
+        && status.setup_blocked_on.as_deref().is_none_or(|b| b.trim().is_empty())
+        && status.owner.as_deref().is_none_or(|owner| owner == me)
+}
+
+/// The tool result when the phone did not come back in time: what happened
+/// and what to do, instead of running the tool against a released phone.
+fn reconnect_on_use_stopped(tool: &str, wait: &ReconnectWait) -> CallToolResult {
+    let blocker = wait
+        .status
+        .as_ref()
+        .and_then(|s| s.setup_blocked_on.clone())
+        .unwrap_or_default();
+    let advice = if blocker.starts_with("needs_passcode") {
+        "starting the device runner may need the passcode on the iPhone to allow automation. If the phone shows that prompt, ask the person to enter it there (never ask for the passcode itself), then call this tool again; if no prompt is showing, check phone_status (hint, setup_message) and the phone's connection instead."
+    } else {
+        match wait.outcome {
+            "retrying" => "the daemon is retrying on its own; call this tool again after wait.status.setup_retry.next_in_secs before asking a person to act.",
+            "blocked" => "a person has to clear wait.status.setup_blocked_on (see wait.status.hint) before the phone can be used; tell them, then call this tool again.",
+            "stopped" => "the phone was handed to a person or the session was ended on the phone; ask before taking it back.",
+            _ => "the phone is still coming back; call phone_status, and call this tool again once drivable=true.",
+        }
+    };
+    let text = serde_json::json!({
+        "ok": false,
+        "error": "phone_not_ready",
+        "outcome": "not_sent",
+        "retry_safe": true,
+        "tool": tool,
+        "note": "the phone was released after the last task; this call started bringing it back and nothing was sent to it",
+        "next": advice,
+        "wait": wait.json,
+    })
+    .to_string();
+    CallToolResult::error(vec![Content::text(text)])
+}
+
+/// What a waiting reconnect ended on.
+struct ReconnectWait {
+    outcome: &'static str,
+    json: serde_json::Value,
+    status: Option<crate::types::StatusResponse>,
+}
+
+/// One blocker as a waiting reconnect has watched it.
+struct BlockerWatch {
+    blocker: String,
+    since: tokio::time::Instant,
+    /// The supervisor's retry attempt when one was first seen scheduled.
+    first_retry: Option<u64>,
+}
+
+impl BlockerWatch {
+    fn observe(watch: Option<Self>, status: &crate::types::StatusResponse) -> Self {
+        let blocker = status.setup_blocked_on.clone().unwrap_or_default();
+        let retry = reconnect_setup_retry(status).map(|(attempt, _)| attempt);
+        match watch {
+            Some(mut seen) if seen.blocker == blocker => {
+                seen.first_retry = seen.first_retry.or(retry);
+                seen
+            }
+            _ => BlockerWatch { blocker, since: tokio::time::Instant::now(), first_retry: retry },
+        }
+    }
+}
+
+/// What a blocker means for the wait now: `None` keeps waiting, `blocked`
+/// ends it, `retrying` ends it with the supervisor's own retry still to come
+/// (after the wait would end), which is not a request for a person (#403).
 fn reconnect_blocker_final(
     status: &crate::types::StatusResponse,
-    held: std::time::Duration,
-) -> bool {
-    let blocker = status.setup_blocked_on.as_deref().unwrap_or_default();
-    status.reconnecting != Some(true)
-        || blocker.starts_with("needs_passcode")
-        || held >= RECONNECT_BLOCKER_SETTLE
+    watch: &BlockerWatch,
+    remaining: std::time::Duration,
+) -> Option<&'static str> {
+    let held = watch.since.elapsed();
+    if status.setup_blocked_on.as_deref().unwrap_or_default().starts_with("needs_passcode") {
+        return Some("blocked");
+    }
+    if let Some((attempt, next_in)) = reconnect_setup_retry(status) {
+        if std::time::Duration::from_secs(next_in) >= remaining {
+            // A slow backoff (minutes) is not about to fix this on its own.
+            return Some(if next_in <= RECONNECT_RETRY_SOON_SECS { "retrying" } else { "blocked" });
+        }
+        // A retry is due inside the wait: the blocker is final only once it
+        // held across at least one of them.
+        let retried = watch.first_retry.is_some_and(|first| attempt > first);
+        return (retried && held >= RECONNECT_BLOCKER_SETTLE).then_some("blocked");
+    }
+    (status.reconnecting != Some(true) || held >= RECONNECT_BLOCKER_SETTLE).then_some("blocked")
 }
 
 /// Parameters for [`PhoneHandler::phone_run_start`].
@@ -842,6 +1014,10 @@ pub struct RunStartParams {
     /// model round trips reported.
     #[serde(default)]
     pub complete_trace: Option<bool>,
+    /// Opt into a bounded, redacted action timeline (no values/screenshots).
+    /// Retrieve with phone_run_trace; restart loses it. Default false.
+    #[serde(default)]
+    pub trace: bool,
 }
 
 /// Parameters for [`PhoneHandler::phone_run_end`].
@@ -853,6 +1029,13 @@ pub struct RunEndParams {
     /// complete trace; `[]` for a task that used no model turns.
     #[serde(default)]
     pub turn_ids: Option<Vec<String>>,
+}
+
+/// Owner-scoped trace lookup.
+#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunTraceParams {
+    pub run_id: String,
 }
 
 /// Parameters for [`PhoneHandler::phone_collect_list`].
@@ -1017,6 +1200,33 @@ impl PhoneHandler {
         Self::with_shared_profile(daemon, std::sync::Arc::new(ToolProfile::from_env()))
     }
 
+    /// When the MCP client goes away, give back the phone leases this process
+    /// still holds, so another session does not wait out the rest of the
+    /// lease (#414). Only a lease the daemon reports as this process's own is
+    /// released, and never under a shared `IPHONE_USE_OWNER` name, which
+    /// another process may be using right now.
+    pub async fn release_own_leases(&self) {
+        if std::env::var("IPHONE_USE_OWNER").is_ok_and(|v| !v.trim().is_empty()) {
+            return;
+        }
+        let mut clients = vec![self.daemon.clone()];
+        if let Ok(instances) = self.instances.lock() {
+            clients.extend(instances.values().map(|h| h.daemon.clone()));
+        }
+        for client in clients {
+            let release = async {
+                let status = client.status().await.ok()?;
+                if status.owner.as_deref() != Some(client.owner()) {
+                    return None;
+                }
+                client.release_owner().await.ok()
+            };
+            if let Ok(Some(_)) = tokio::time::timeout(std::time::Duration::from_secs(5), release).await {
+                tracing::info!("released this session's phone lease on exit ({})", client.owner());
+            }
+        }
+    }
+
     /// One handler per MCP session (`--listen` serves many), sharing the
     /// profile read once at start.
     pub(crate) fn with_shared_profile(
@@ -1029,7 +1239,22 @@ impl PhoneHandler {
             progress: std::sync::Arc::default(),
             profile,
             instances: std::sync::Arc::default(),
+            usable_seen: std::sync::Arc::default(),
         }
+    }
+
+    fn note_usable(&self, usable: bool) {
+        if let Ok(mut seen) = self.usable_seen.lock() {
+            *seen = usable.then(std::time::Instant::now);
+        }
+    }
+
+    fn usable_recently(&self) -> bool {
+        self.usable_seen
+            .lock()
+            .ok()
+            .and_then(|seen| *seen)
+            .is_some_and(|at| at.elapsed() < RECONNECT_CHECK_FRESH)
     }
 
     /// The same handler exposing `profile` instead of the environment's.
@@ -1088,6 +1313,107 @@ impl PhoneHandler {
         if let Ok(mut tracker) = self.progress.lock() {
             tracker.reset();
         }
+    }
+
+    /// Bring a released phone back before a tool that needs it: `Ok(note)`
+    /// runs the tool (with a line saying it reconnected), `Err(result)`
+    /// returns that instead. Anything unexpected runs the tool unchanged, so
+    /// the daemon's own refusal still reaches the model.
+    async fn reconnect_for_use(&self, tool: &str) -> Result<Option<String>, CallToolResult> {
+        if self.usable_recently() {
+            return Ok(None);
+        }
+        let Ok(status) = self.daemon.status().await else { return Ok(None) };
+        if status.drivable == Some(true) {
+            self.note_usable(true);
+        }
+        if !may_reconnect_for_use(&status, self.daemon.owner()) {
+            return Ok(None);
+        }
+        if status.reconnecting != Some(true) {
+            if let Err(error) = self.daemon.reconnect().await {
+                tracing::debug!("reconnect on use failed: {error:#}");
+                return Ok(None);
+            }
+        }
+        self.progress_reset();
+        let wait = self.wait_until_drivable(RECONNECT_ON_USE_BUDGET).await;
+        if wait.outcome == "drivable" {
+            self.note_usable(true);
+            return Ok(Some(format!(
+                "the phone was released after the last task; brought it back for this call in {} s",
+                wait.json["waited_secs"]
+            )));
+        }
+        Err(reconnect_on_use_stopped(tool, &wait))
+    }
+
+    /// Poll status until the phone is drivable, a blocker settles, the
+    /// supervisor's own retry is still to come, or `budget` runs out
+    /// (`phone_reconnect wait_secs`, and the on-use reconnect).
+    async fn wait_until_drivable(&self, budget: std::time::Duration) -> ReconnectWait {
+        let started = tokio::time::Instant::now();
+        let deadline = started + budget;
+        let mut last_status = None;
+        let mut last_error: Option<String> = None;
+        let mut blocked: Option<BlockerWatch> = None;
+        let outcome = loop {
+            if tokio::time::Instant::now() >= deadline { break "timeout"; }
+            let status = match tokio::time::timeout_at(deadline, self.daemon.status()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    last_error = Some("status read exceeded the remaining wait budget".to_string());
+                    break "timeout";
+                }
+            };
+            match status {
+                Ok(status) => {
+                    let done = match reconnect_wait_outcome(&status) {
+                        Some("blocked") => {
+                            let watch = BlockerWatch::observe(blocked.take(), &status);
+                            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                            let done = reconnect_blocker_final(&status, &watch, remaining);
+                            blocked = Some(watch);
+                            done
+                        }
+                        Some(done) => Some(done),
+                        None => {
+                            blocked = None;
+                            None
+                        }
+                    };
+                    last_status = Some(status);
+                    last_error = None;
+                    if let Some(done) = done {
+                        break done;
+                    }
+                }
+                Err(e) => last_error = Some(format!("{e:#}")),
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break "timeout";
+            }
+            tokio::time::sleep(std::cmp::min(RECONNECT_POLL, deadline - now)).await;
+        };
+        // Out of time with the supervisor still retrying a blocker: say so,
+        // rather than a bare timeout or a settled blocker.
+        // Only from a status read that succeeded last; a failed or hung read
+        // stays a timeout with its status_error.
+        let retry = last_status.as_ref().filter(|_| last_error.is_none()).and_then(reconnect_setup_retry);
+        let outcome = match (outcome, &blocked, retry) {
+            ("timeout", Some(_), Some(_)) => "retrying",
+            (outcome, ..) => outcome,
+        };
+        let mut wait = serde_json::json!({
+            "outcome": outcome,
+            "waited_secs": started.elapsed().as_secs(),
+            "status": last_status.as_ref().map(reconnect_brief),
+        });
+        if let Some(error) = last_error {
+            wait["status_error"] = error.into();
+        }
+        ReconnectWait { outcome, json: wait, status: last_status }
     }
 
     fn remember_flow_failure(&self, context: crate::contrib::ReportContext) {
@@ -1771,6 +2097,17 @@ impl PhoneHandler {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = true),
+        description = "Read one native element's bounded subtree by element+snapshot, serializing only that element (locator lookup may still read the app tree). Requires a unique live semantic target and a runner with ipu:elementSubtree. Returned row positions are READ ONLY, not action refs; use unique locators or fresh phone_elements refs for input. complete=false means descendants may be missing."
+    )]
+    async fn phone_subtree(&self, Parameters(params): Parameters<SubtreeParams>) -> CallToolResult {
+        match self.daemon.subtree(&params.snapshot, params.element, params.max_depth.unwrap_or(8), params.max_nodes.unwrap_or(500)).await {
+            Ok(body) => CallToolResult::success(vec![Content::text(body)]),
+            Err(error) => CallToolResult::error(vec![Content::text(format!("subtree read failed: {error:#}"))]),
+        }
+    }
+
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = true),
         description = "The current screen as text — use this instead of screenshots (an order \
         of magnitude cheaper). Rows carry kind, label, identifier, value, rect and state, plus a \
         `snapshot` token for phone_tap_element; indexes and snapshot tokens are valid for this read \
@@ -1918,9 +2255,11 @@ impl PhoneHandler {
             open_world_hint = true,
         ),
         description = "Tap one element by its zero-based index and snapshot token \
-        from the SAME phone_elements response. The daemon re-reads the tree and \
-        refuses the action if the UI changed, so a stale element reference cannot \
-        silently tap a different control. Use identifier/kind/label/state fields to \
+        from the SAME phone_elements response. The daemon re-reads the tree; a small \
+        change on the same screen (clock, badge, a flipped switch) still finds the row \
+        by kind, identifier, label and enclosing rows, while another page, a new alert, \
+        or look-alikes it cannot tell apart refuse with nothing sent, so a stale element \
+        reference cannot silently tap a different control. Use identifier/kind/label/state fields to \
         choose the index. Snapshot refs are ephemeral: never persist them in a flow."
     )]
     async fn phone_tap_element(
@@ -2044,7 +2383,11 @@ impl PhoneHandler {
         or a blocker remains. Once these conditions are met, call once, \
         then wait for the outcome: pass wait_secs (e.g. 180) to block until drivable=true, \
         a blocker (setup_blocked_on), or the timeout, instead of polling phone_status; \
-        `wait.outcome` is drivable, blocked, stopped or timeout. While it is reconnecting, report \
+        `wait.outcome` is drivable, blocked, retrying, stopped or timeout; retrying means the \
+        supervisor will retry the blocker on its own within a minute, after the wait \
+        (wait.status.setup_retry.next_in_secs) — check phone_status after that before asking a \
+        person to act. A retry further out than a minute, or a blocker that held across one \
+        retry, is blocked. While it is reconnecting, report \
         setup_phase/setup_message and obey setup_blocked_on. This tool \
         never accepts a UDID and cannot switch devices. \
         An externally managed runner returns an operator-owned recovery error."
@@ -2074,64 +2417,10 @@ impl PhoneHandler {
         let Some(wait_secs) = wait_secs else {
             return CallToolResult::success(vec![Content::text(body)]);
         };
-        let started = tokio::time::Instant::now();
-        let deadline = started + std::time::Duration::from_secs(wait_secs);
-        let mut last_status = None;
-        let mut last_error: Option<String> = None;
-        let mut blocked_since: Option<(String, tokio::time::Instant)> = None;
-        let outcome = loop {
-            if tokio::time::Instant::now() >= deadline { break "timeout"; }
-            let status = match tokio::time::timeout_at(deadline, self.daemon.status()).await {
-                Ok(status) => status,
-                Err(_) => {
-                    last_error = Some("status read exceeded the remaining wait budget".to_string());
-                    break "timeout";
-                }
-            };
-            match status {
-                Ok(status) => {
-                    let done = reconnect_wait_outcome(&status);
-                    let finished = match done {
-                        Some("blocked") => {
-                            let blocker = status.setup_blocked_on.clone().unwrap_or_default();
-                            let since = match &blocked_since {
-                                Some((seen, at)) if *seen == blocker => *at,
-                                _ => tokio::time::Instant::now(),
-                            };
-                            blocked_since = Some((blocker, since));
-                            reconnect_blocker_final(&status, since.elapsed())
-                        }
-                        Some(_) => true,
-                        None => {
-                            blocked_since = None;
-                            false
-                        }
-                    };
-                    last_status = Some(status);
-                    last_error = None;
-                    if finished {
-                        break done.unwrap_or("drivable");
-                    }
-                }
-                Err(e) => last_error = Some(format!("{e:#}")),
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break "timeout";
-            }
-            tokio::time::sleep(std::cmp::min(RECONNECT_POLL, deadline - now)).await;
-        };
+        let wait = self.wait_until_drivable(std::time::Duration::from_secs(wait_secs)).await;
         let reconnect = serde_json::from_str::<serde_json::Value>(&body)
             .unwrap_or(serde_json::Value::String(body));
-        let mut wait = serde_json::json!({
-            "outcome": outcome,
-            "waited_secs": started.elapsed().as_secs(),
-            "status": last_status.as_ref().map(reconnect_brief),
-        });
-        if let Some(error) = last_error {
-            wait["status_error"] = error.into();
-        }
-        let text = serde_json::json!({"reconnect": reconnect, "wait": wait}).to_string();
+        let text = serde_json::json!({"reconnect": reconnect, "wait": wait.json}).to_string();
         CallToolResult::success(vec![Content::text(text)])
     }
 
@@ -2156,11 +2445,22 @@ impl PhoneHandler {
         self.progress_reset();
         match self
             .daemon
-            .run_start(&params.run_id, params.complete_trace.unwrap_or(false))
+            .run_start_with_trace(&params.run_id, params.complete_trace.unwrap_or(false), params.trace)
             .await
         {
             Ok(body) => CallToolResult::success(vec![Content::text(body)]),
             Err(e) => CallToolResult::error(vec![Content::text(format!("run start failed: {e:#}"))]),
+        }
+    }
+
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = true),
+        description = "Read this session's redacted action timeline for a run started with trace=true. Bounded memory only; includes counts and delivery/verification receipts, never typed values or screenshots. It cannot replay actions."
+    )]
+    async fn phone_run_trace(&self, Parameters(params): Parameters<RunTraceParams>) -> CallToolResult {
+        match self.daemon.action_trace(&params.run_id).await {
+            Ok(body) => CallToolResult::success(vec![Content::text(body)]),
+            Err(error) => CallToolResult::error(vec![Content::text(format!("trace read failed: {error:#}"))]),
         }
     }
 
@@ -2288,6 +2588,9 @@ impl PhoneHandler {
             open_world_hint = false,
         ),
         description = "Release this session's phone lease when its task ends, so another session can drive immediately. \
+        It also frees the phone: a daemon-managed runner is stopped right away, so the phone leaves automation \
+        mode, unless a live viewer, an active phone_hold or a recording keeps it (IPHONE_USE_TASK_END_RELEASE=0 \
+        keeps the runner until the idle window); the next phone tool brings it back. \
         Unlike phone_hold(secs=0), this gives up ownership rather than merely clearing a pause. It sends no \
         phone input and returns ok with owner=null; releasing an already-unowned phone succeeds. A different \
         session's active lease returns phone_owned and is never taken over. Authentication/transport \
@@ -3349,6 +3652,16 @@ fn shape_structured(mut result: CallToolResult, mode: StructuredMode) -> CallToo
                     if !receipt.is_empty() { slim.insert(key.clone(), serde_json::Value::Object(receipt)); }
                     continue;
                 }
+                // How far a set_value replacement got (#399): its counts and
+                // where it stopped, without the per-segment list.
+                if key == "replacement" {
+                    let receipt: serde_json::Map<String, serde_json::Value> = ["phase", "segments_total", "segments_delivered",
+                        "characters_confirmed", "characters_uncertain", "characters_total", "stopped_at_segment"]
+                        .into_iter().filter_map(|name| value.get(name).filter(|field| !field.is_null())
+                            .map(|field| (name.to_string(), field.clone()))).collect();
+                    if !receipt.is_empty() { slim.insert(key.clone(), serde_json::Value::Object(receipt)); }
+                    continue;
+                }
                 if key == "system_capture" {
                     let receipt: serde_json::Map<String, serde_json::Value> = ["requested", "saved_verified"]
                         .into_iter().filter_map(|name| value.get(name).filter(|field| field.is_boolean())
@@ -3439,8 +3752,35 @@ impl ServerHandler for PhoneHandler {
             None => None,
         };
         let handler = selected.as_ref().unwrap_or(self);
+        let mut reconnected = None;
+        if reconnect_on_use(&name, request.arguments.as_ref()) {
+            match handler.reconnect_for_use(&name).await {
+                Ok(note) => reconnected = note,
+                Err(stopped) => {
+                    let mut result = finish_result(&name, stopped, StructuredMode::from_env());
+                    if let Some(instance) = &instance {
+                        result.content.insert(0, Content::text(format!("instance: {instance}")));
+                    }
+                    return Ok(result);
+                }
+            }
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(handler, request, context);
         let mut result = Self::tool_router().call(tcc).await?;
+        // Last, so a result whose text is the JSON body still starts with it.
+        if let Some(note) = reconnected {
+            result.content.push(Content::text(note));
+        }
+        if name == "phone_release_owner" || refused_as_released(&result) {
+            // The task ended, or the phone was released under this session
+            // (another session's task end, an idle release): check again.
+            handler.note_usable(false);
+        } else if RECONNECT_ON_USE_TOOLS.contains(&name.as_ref())
+            && name != "phone_record"
+            && result.is_error != Some(true)
+        {
+            handler.note_usable(true);
+        }
         result.meta.get_or_insert_with(rmcp::model::Meta::new).0
             .insert("iphone-use/instance".into(), serde_json::json!(instance));
         if let Some(instance) = &instance {
@@ -3512,13 +3852,15 @@ impl ServerHandler for PhoneHandler {
                  1. If the user names a phone or there are multiple installed phones, use phone_instances \
                  and pass the chosen instance on every phone_* call. Omitted instance describes only the configured daemon, \
                  never all phones. Explicit unavailable instances fail without fallback. \
-                 phone_status — act only when drivable=true. If not, pause screen reads/actions and follow recovery/next_step. \
+                 phone_status — act only when drivable=true, with one exception: released=true (freed after the last task) is \
+                 brought back by the next phone tool itself (elements, tap, run_steps, …), which waits for it and answers \
+                 phone_not_ready with what to do if a person must act (e.g. the passcode). Otherwise pause screen reads/actions and follow recovery/next_step. \
                  For target_configured=false with recovery_owner=unconfigured, inspect xcrun devicectl list devices and run iphone-use doctor on the daemon host; \
                  ask which device if ambiguous, then IPU_RUNNER_UDID=<UDID> iphone-use setup only for an authorized confirmed target. \
                  Preserve --instance for named instances; external runners recover on their owning host, never via local setup. Do not take over another owner or bypass privacy/handoff. \
                  For trust/passcode blockers, the person acts on the phone; never ask for their passcode, pause screen reads during entry, \
                  then verify status and resume the original task. Do not loop setup or reconnect; \
-                 call phone_reconnect once only when the user's current task needs the phone \
+                 call phone_reconnect once only when the user's current task needs the phone and a tool did not bring it back \
                  (each reconnect may make the user type the passcode), never for health checks.\n\
                  2. Look for a saved flow FIRST. Responses that enter an app (launch_app, the first \
                  phone_elements in a new app) carry a `registry` block: if a listed flow does the task, \
@@ -3540,7 +3882,8 @@ impl ServerHandler for PhoneHandler {
                  5. A response carrying `flow_suggestion`, or any finished multi-step task with no flow: \
                  ASK THE USER whether to save it. Only if they agree: phone_flow_draft, fix its todo list, \
                  phone_flow_run the file once, then phone_flow_publish(confirm=true) with their OK.\n\
-                 Call phone_release_owner when the task is done.",
+                 Call phone_release_owner when the task is done: it also frees the phone (the device runner stops, so the \
+                 phone leaves automation mode); the next task's first phone tool brings it back.",
             )
     }
 }
@@ -4074,6 +4417,11 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
                     return Err(format!(
                         "steps[{index}] ocr_present/ocr_absent entries must be 1 to 200 characters of visible text; no action was sent"
                     ));
+                }
+                if expect.absent_after_present
+                    && (expect.absent.is_empty() && expect.ocr_absent.is_empty() || timeout_ms == 0)
+                {
+                    return Err(format!("steps[{index}]: absent_after_present needs absent/ocr_absent and a nonzero timeout; no action was sent"));
                 }
                 let max_wait = if ocr { MAX_OCR_WAIT_MS } else { MAX_WAIT_MS };
                 if expect
@@ -4617,6 +4965,37 @@ mod tests {
     // ---------------------------------------------------------------------
     // Real tool calls against a scripted daemon.
     // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn exit_releases_only_a_lease_this_process_holds() {
+        // #414: a closed client used to leave its lease for the rest of the 300 s.
+        if std::env::var("IPHONE_USE_OWNER").is_ok() {
+            return;
+        }
+        let me = DaemonClient::new("http://127.0.0.1:1", None).owner().to_string();
+        let ours = format!(r#"{{"ok":true,"owner":"{me}","owner_lease_remaining_secs":180}}"#);
+        let (url, server, requests) = crate::client::tests::mock_daemon_sequence(&[
+            ("200 OK", &ours),
+            ("200 OK", r#"{"ok":true,"owner":null}"#),
+        ]);
+        PhoneHandler::new(DaemonClient::new(url, None)).release_own_leases().await;
+        server.join().unwrap();
+        let status = requests.recv().unwrap();
+        let release = requests.recv().unwrap();
+        assert!(status.starts_with("GET /agent/status"), "{status}");
+        assert!(release.starts_with("POST /agent/owner"), "{release}");
+        assert!(release.to_ascii_lowercase().contains(&format!("x-phone-owner: {}", me.to_ascii_lowercase())), "{release}");
+        assert!(release.contains(r#"{"release":true}"#), "{release}");
+
+        // Another session's lease, or none: read, never release.
+        for other in [r#"{"ok":true,"owner":"mcp-1","owner_lease_remaining_secs":180}"#, r#"{"ok":true,"owner":null}"#] {
+            let (url, server, requests) = crate::client::tests::mock_daemon_sequence(&[("200 OK", other)]);
+            PhoneHandler::new(DaemonClient::new(url, None)).release_own_leases().await;
+            server.join().unwrap();
+            assert!(requests.recv().unwrap().starts_with("GET /agent/status"));
+            assert!(requests.try_recv().is_err(), "must not release a lease it does not hold: {other}");
+        }
+    }
 
     /// One-shot HTTP responder. Returns the URL and a join handle so a panic
     /// inside it surfaces in the test.
@@ -5261,7 +5640,7 @@ mod tests {
 
     /// The tools that only read: no phone input, no outward-facing writes.
     /// `IPHONE_USE_MCP_TOOLS=readonly` exposes exactly these.
-    const READ_ONLY_TOOLS: [&str; 15] = [
+    const READ_ONLY_TOOLS: [&str; 17] = [
         "phone_apps",
         "phone_capabilities",
         "phone_crashes",
@@ -5273,10 +5652,12 @@ mod tests {
         "phone_instances",
         "phone_metrics",
         "phone_read_value",
+        "phone_run_trace",
         "phone_screen",
         "phone_screen_frame",
         "phone_screenshot",
         "phone_status",
+        "phone_subtree",
     ];
 
     /// Every tool states read_only_hint and open_world_hint explicitly (the
@@ -5559,6 +5940,7 @@ mod tests {
                     absent: vec![],
                     ocr_present: vec![],
                     ocr_absent: vec![],
+                absent_after_present: false,
                 },
                 timeout_ms: 2_000,
                 poll_ms: 100,
@@ -5911,6 +6293,7 @@ mod tests {
                 absent: vec![],
                 ocr_present: vec![],
                 ocr_absent: vec![],
+                absent_after_present: false,
             },
             timeout_ms: 30_001,
             poll_ms: 100,
@@ -5927,6 +6310,7 @@ mod tests {
                 absent: vec![],
                 ocr_present: vec![],
                 ocr_absent: vec![],
+                absent_after_present: false,
             },
             timeout_ms: 30_000,
             poll_ms: 100,
@@ -5949,6 +6333,7 @@ mod tests {
                 absent: vec![],
                 ocr_present: vec![],
                 ocr_absent: vec![],
+                absent_after_present: false,
             },
             timeout_ms: 1_000,
             poll_ms: 100,
@@ -5975,19 +6360,116 @@ mod tests {
         assert_eq!(reconnect_wait_outcome(&blocked), Some("blocked"));
         // The passcode ends the wait at once; a transient early blocker only
         // once it has held, or once the daemon stopped reconnecting.
-        let zero = std::time::Duration::ZERO;
-        assert!(reconnect_blocker_final(&blocked, zero));
+        let long = std::time::Duration::from_secs(60);
+        let fresh = |s: &crate::types::StatusResponse| BlockerWatch::observe(None, s);
+        let aged = |s: &crate::types::StatusResponse| {
+            let mut watch = BlockerWatch::observe(None, s);
+            watch.since -= RECONNECT_BLOCKER_SETTLE;
+            watch
+        };
+        assert_eq!(reconnect_blocker_final(&blocked, &fresh(&blocked), long), Some("blocked"));
         let ddi = status(serde_json::json!({"ok": true, "drivable": false,
             "reconnecting": true, "setup_blocked_on": "usb", "setup_phase": "ddi-wait"}));
         assert_eq!(reconnect_wait_outcome(&ddi), Some("blocked"));
-        assert!(!reconnect_blocker_final(&ddi, zero));
-        assert!(reconnect_blocker_final(&ddi, RECONNECT_BLOCKER_SETTLE));
+        assert_eq!(reconnect_blocker_final(&ddi, &fresh(&ddi), long), None);
+        assert_eq!(reconnect_blocker_final(&ddi, &aged(&ddi), long), Some("blocked"));
         let gave_up = status(serde_json::json!({"ok": true, "drivable": false,
             "reconnecting": false, "setup_blocked_on": "usb"}));
-        assert!(reconnect_blocker_final(&gave_up, zero));
+        assert_eq!(reconnect_blocker_final(&gave_up, &fresh(&gave_up), long), Some("blocked"));
         let brief = reconnect_brief(&blocked);
         assert_eq!(brief["setup_blocked_on"], "needs_passcode_on_phone");
         assert_eq!(brief["drivable"], false);
+    }
+
+    #[test]
+    fn only_a_released_phone_nobody_decided_about_is_brought_back_for_a_tool() {
+        let status = |extra: serde_json::Value| -> crate::types::StatusResponse {
+            let mut base = serde_json::json!({"ok": true, "drivable": false, "released": true,
+                "reconnecting": false, "recovery_owner": "daemon"});
+            base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(base).unwrap()
+        };
+        assert!(may_reconnect_for_use(&status(serde_json::json!({})), "me"));
+        assert!(may_reconnect_for_use(&status(serde_json::json!({"owner": "me"})), "me"));
+        for refused in [
+            serde_json::json!({"drivable": true, "released": false}),
+            serde_json::json!({"released": false}),
+            serde_json::json!({"human_handoff": true}),
+            serde_json::json!({"ended_on_phone": true}),
+            serde_json::json!({"runner_parked": true}),
+            serde_json::json!({"releasing": true}),
+            serde_json::json!({"recovery_owner": "external"}),
+            serde_json::json!({"setup_blocked_on": "trust"}),
+            serde_json::json!({"owner": "another-session"}),
+        ] {
+            assert!(!may_reconnect_for_use(&status(refused.clone()), "me"), "{refused}");
+        }
+        // Already coming back (a released phone whose reconnect is running).
+        assert!(may_reconnect_for_use(&status(serde_json::json!({"reconnecting": true})), "me"));
+        assert!(RECONNECT_ON_USE_TOOLS.contains(&"phone_elements"));
+        for never in ["phone_status", "phone_release_owner", "phone_hold", "phone_flow_list", "phone_screen", "phone_reconnect",
+            "phone_home_layout", "phone_apps", "phone_install_app", "phone_set_location"] {
+            assert!(!RECONNECT_ON_USE_TOOLS.contains(&never), "{never}");
+        }
+        let tools: Vec<String> = PhoneHandler::tool_router().list_all().into_iter().map(|t| t.name.to_string()).collect();
+        for tool in RECONNECT_ON_USE_TOOLS {
+            assert!(tools.iter().any(|t| t == tool), "{tool} is not a tool");
+        }
+        let passcode = ReconnectWait {
+            outcome: "blocked",
+            json: serde_json::json!({"outcome": "blocked"}),
+            status: Some(status(serde_json::json!({"setup_blocked_on": "needs_passcode_on_phone"}))),
+        };
+        let text = reconnect_on_use_stopped("phone_tap", &passcode).content[0].as_text().unwrap().text.clone();
+        assert!(text.contains("phone_not_ready") && text.contains("never ask for the passcode"), "{text}");
+        let args = |v: serde_json::Value| v.as_object().cloned();
+        assert!(reconnect_on_use("phone_record", args(serde_json::json!({"action": "start"})).as_ref()));
+        assert!(!reconnect_on_use("phone_record", args(serde_json::json!({"action": "status"})).as_ref()));
+        assert!(!reconnect_on_use("phone_record", args(serde_json::json!({"action": "stop"})).as_ref()));
+        assert!(reconnect_on_use("phone_flow_run", args(serde_json::json!({"id": "health/export"})).as_ref()));
+        assert!(!reconnect_on_use("phone_flow_run", args(serde_json::json!({"id": "Not A Flow"})).as_ref()));
+        assert!(reconnect_on_use("phone_elements", None));
+        assert!(!may_reconnect_for_use(&status(serde_json::json!({"screen_private_secs": 30})), "me"));
+        let refused = CallToolResult::error(vec![Content::text(r#"{"ok":false,"error":"released","reconnecting":false}"#)]);
+        assert!(refused_as_released(&refused));
+        assert!(!refused_as_released(&CallToolResult::success(vec![Content::text(r#"{"released":true}"#)])));
+    }
+
+    #[test]
+    fn a_waiting_reconnect_waits_out_the_supervisors_own_retry() {
+        // #403: a failed prerequisite round with a KeepAlive retry 5 s away.
+        let status = |attempt: u64, next_in: u64| -> crate::types::StatusResponse {
+            serde_json::from_value(serde_json::json!({"ok": true, "drivable": false,
+                "reconnecting": false, "setup_blocked_on": "usb", "setup_phase": "prereq-fail",
+                "setup_retry": {"kind": "generic", "attempt": attempt, "next_in_secs": next_in}}))
+            .unwrap()
+        };
+        let long = std::time::Duration::from_secs(30);
+        let first = status(1, 5);
+        let watch = BlockerWatch::observe(None, &first);
+        assert_eq!(reconnect_blocker_final(&first, &watch, long), None, "a retry is coming");
+        // The retry ran and failed again, but the blocker has not held long.
+        let again = status(2, 10);
+        let watch = BlockerWatch::observe(Some(watch), &again);
+        assert_eq!(watch.first_retry, Some(1));
+        assert_eq!(reconnect_blocker_final(&again, &watch, long), None);
+        let mut held = watch;
+        held.since -= RECONNECT_BLOCKER_SETTLE;
+        assert_eq!(reconnect_blocker_final(&again, &held, long), Some("blocked"));
+        // A retry after the wait would end: not settled, and not a request for a person.
+        let later = status(1, 45);
+        assert_eq!(reconnect_blocker_final(&later, &BlockerWatch::observe(None, &later), long), Some("retrying"));
+        assert_eq!(reconnect_brief(&later)["setup_retry"]["next_in_secs"], 45);
+        let slow = status(4, 900);
+        assert_eq!(reconnect_blocker_final(&slow, &BlockerWatch::observe(None, &slow), long), Some("blocked"));
+    }
+
+    #[test]
+    fn a_waiting_reconnect_brief_without_retry_is_null() {
+        let blocked: crate::types::StatusResponse = serde_json::from_value(serde_json::json!({
+            "ok": true, "drivable": false, "reconnecting": true,
+            "setup_blocked_on": "needs_passcode_on_phone"})).unwrap();
+        assert!(reconnect_brief(&blocked)["setup_retry"].is_null());
     }
 
     #[test]
@@ -6000,6 +6482,7 @@ mod tests {
                     absent: vec![],
                     ocr_present: present.into_iter().map(str::to_string).collect(),
                     ocr_absent: vec![],
+                absent_after_present: false,
                 },
                 timeout_ms,
                 poll_ms: 500,
@@ -6027,6 +6510,7 @@ mod tests {
                     absent: vec![],
                     ocr_present: vec![],
                     ocr_absent: vec![],
+                absent_after_present: false,
                 },
                 timeout_ms: 10_000,
                 poll_ms: 100,
@@ -6204,6 +6688,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_slim_structure_keeps_how_far_a_replacement_got() {
+        let mut result = CallToolResult::error(vec![Content::text("FAILED set_value")]);
+        result.structured_content = Some(serde_json::json!({
+            "ok": false,
+            "error": "outcome_unknown",
+            "replacement": {"path": "guarded", "phase": "type", "clear": {"status": "cleared"},
+                "segments_total": 3, "segments_delivered": 1, "characters_confirmed": 200,
+                "characters_uncertain": 200, "characters_total": 450, "stopped_at_segment": 2,
+                "segments": [{"segment": 1, "characters": 200, "status": "delivered"}]},
+        }));
+        let slim = shape_structured(result, StructuredMode::Slim).structured_content.unwrap();
+        assert_eq!(slim["replacement"], serde_json::json!({"phase": "type", "segments_total": 3,
+            "segments_delivered": 1, "characters_confirmed": 200, "characters_uncertain": 200,
+            "characters_total": 450, "stopped_at_segment": 2}));
     }
 
     #[test]
