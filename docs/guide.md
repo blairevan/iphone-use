@@ -909,6 +909,22 @@ a few seconds; an iOS 27.0 iPhone 13 came up drivable in about 45 s with no cabl
 whose iOS refuses that (`wifi_automation_refused`) needs the cable again whenever its
 runner has to restart, so idle release leaves its Wi-Fi runner up.
 
+If Bonjour discovery is unavailable, the Mac supervisor can recover a previously
+paired iOS 17+ phone without entering its IP. USB setup saves an independent private
+RemotePairing identity and a separate address profile for each physical Wi-Fi/LAN
+network. Returning home or to the office selects that network's verified address
+and untrusted Runner hint, including when their IP ranges overlap. Recovery
+verifies the selected address first; if it fails, it queries that network's hint
+and at most 32 complete neighbors on active physical LAN interfaces
+with unicast DNS-SD, matches the paired service identity, and verifies the tunnel's
+RSD device ID before saving an address. It uses a native Rust TLS-PSK userspace
+tunnel and starts the installed Runner's XCTest host over that same tunnel. Control
+and video listeners stay on Mac loopback. No Python runtime, root network service,
+router changes, or VPN shutdown is needed. `IPU_RUNNER_TRANSPORT=usb` disables this
+fallback too. Keep the phone unlocked on the same LAN; if the cached address, hint
+and neighbor table cannot locate it, reconnect USB. A first install, missing Runner or expired developer
+profile still needs the normal USB setup. See [implementation and validation](wifi-auto-reconnect.md).
+
 **Who may end a reconnect.** A bring-up is owned by the task that started it, and only
 that owner ends it. Every begin mints a generation, so a late task cannot end the round
 that replaced it, and `GET /agent/status` never ends one: reading status refreshes the

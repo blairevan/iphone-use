@@ -194,6 +194,9 @@ pub fn runner_signature_valid(signature: &str) -> bool {
     if !safe_expected(signature) {
         return false;
     }
+    if wifi_signature_valid(signature) {
+        return true;
+    }
     if legacy_launch_valid(signature) {
         return true;
     }
@@ -288,6 +291,9 @@ fn legacy_launch_valid(signature: &str) -> bool {
 }
 
 fn relay_signature_valid(signature: &str) -> bool {
+    if wifi_signature_valid(signature) {
+        return true;
+    }
     let tokens: Vec<&str> = signature.split(' ').collect();
     match tokens.as_slice() {
         [program, "relay", "--udid", udid, "--listen", listen, "--device-port", port] => {
@@ -335,6 +341,26 @@ fn relay_signature_valid(signature: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Recognize only the exact supervised native Wi-Fi worker argument shape.
+fn wifi_signature_valid(signature: &str) -> bool {
+    let tokens: Vec<_> = signature.split(' ').collect();
+    let [program, "wifi-native", "serve", "--udid", udid, "--state-dir", state, "--runner-port", control, "--mjpeg-port", video, "--bundle-id", bundle] =
+        tokens.as_slice()
+    else {
+        return false;
+    };
+    let port = |value: &str| value.parse::<u16>().is_ok_and(|n| n > 0);
+    program.starts_with('/')
+        && program.ends_with("/iphone-use")
+        && crate::wifi::normalized_udid(udid).is_some()
+        && state.starts_with('/')
+        && !state.contains('|')
+        && port(control)
+        && port(video)
+        && control != video
+        && valid_bundle_id(bundle)
 }
 
 /// Whether `command` (a live process's full argv) is the process `expected`
@@ -719,6 +745,23 @@ pub fn verify_loopback_listener(
 
 #[cfg(test)]
 mod tests {
+    /// All three roles accept only the complete, exact native Wi-Fi worker argv.
+    #[test]
+    fn wifi_worker_signature_is_strict() {
+        let command = "/tmp/iphone-use wifi-native serve --udid 000000000000000000000001 --state-dir /tmp/instance --runner-port 8100 --mjpeg-port 9100 --bundle-id com.example.runner.xctrunner";
+        for prefix in ["runner", "relay", "mjpeg"] {
+            assert!(command_matches(command, &format!("{prefix}:{command}")));
+            for invalid in [
+                command.replace("serve", "remember"),
+                command.replace("8100", "0"),
+                command.replace("9100", "8100"),
+                command.replace("000000000000000000000001", "01"),
+                format!("{command} --extra"),
+            ] {
+                assert!(!command_matches(&invalid, &format!("{prefix}:{invalid}")));
+            }
+        }
+    }
     use super::*;
 
     const RUNNER: &str = "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -destination platform=iOS,id=00008110-0002346211A0401E test-without-building -xctestrun /Users/leo/.iphone-use/instances/i13/runner-build/Build/Products/IPhoneUseRunner_iphoneos27.0-arm64.xctestrun -only-testing:IPhoneUseRunnerUITests/RunnerTests/testServe";
