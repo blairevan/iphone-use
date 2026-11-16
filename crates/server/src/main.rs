@@ -159,6 +159,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Internal encrypted Wi-Fi transport; endpoints are selected automatically.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    WifiNative(server::wifi::Options),
     /// Start the daemon and browser/API server.
     Serve,
     /// Receive an explicitly saved file through the Runner's native Files inbox.
@@ -910,6 +914,8 @@ fn main() -> Result<()> {
             let target = onboarding::Target::resolve(instance.as_deref())?;
             std::process::exit(onboarding::run_setup(&target, &["resume".to_string()]))
         }
+        #[cfg(target_os = "macos")]
+        Command::WifiNative(options) => options.run(),
         Command::SetupNative { args } => std::process::exit(server::setup::main(&args)),
         Command::SetupApp { instance, args } => {
             if let Some(name) = instance {

@@ -81,6 +81,10 @@ plist = "1.7"
 unicode-segmentation = "1.13.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Host-side recovery must not pull pairing/DTX crypto into the on-phone daemon.
+idevice = { version = "=0.1.68", default-features = false, features = ["ring", "xctest", "tcp", "usbmuxd", "remote_pairing"] }
+uuid = { version = "1", features = ["v4"] }
+ns-keyed-archive = "0.1.5"
 browser-session = { path = "../browser-session", features = ["desktop"] }
 objc2-core-foundation = "0.3.2"
 objc2-core-media = "0.3.2"

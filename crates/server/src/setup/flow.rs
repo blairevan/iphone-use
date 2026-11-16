@@ -24,6 +24,8 @@ use super::status;
 use super::sys;
 use super::term::{die, info, ok, warn, Exit, Step, BOLD, RST};
 use super::usbdiag;
+#[path = "wifi_flow.rs"]
+mod wifi_flow;
 
 const RUNNER_DEVICE_PORT: u16 = 8100;
 const MJPEG_DEVICE_PORT: u16 = 9100;
@@ -86,6 +88,8 @@ pub struct Setup {
     /// The target is off USB and this run reaches it through CoreDevice's
     /// encrypted Wi-Fi tunnel (`IPU_RUNNER_TRANSPORT=auto`).
     over_tunnel: bool,
+    /// A verified paired identity can replace unavailable CoreDevice discovery.
+    direct_wifi: bool,
     interactive_lock: Option<InteractiveLock>,
     /// Set when the phone takes the legacy (iOS 15/16) path.
     legacy_ios: Option<LegacyRun>,
@@ -181,6 +185,7 @@ impl Setup {
             prebuild_only: false,
             upgrade_rebuild: false,
             relay_over_tunnel: false,
+            direct_wifi: false,
             supervisor_generation: None,
             runner_log_mark: 0,
             _interactive_guard: None,
@@ -557,6 +562,9 @@ impl Setup {
         }
         self.prerequisites()?;
         self.resolve_device()?;
+        if self.direct_wifi {
+            return self.start_direct_wifi();
+        }
         let source_hash = self.runner_source()?;
         self.embed = self.embed_library()?;
         let (deployment_override, sdk) = self.xcconfig()?;
@@ -564,6 +572,9 @@ impl Setup {
         self.legacy = Legacy::new(&self.ctx, &self.ctx.team_id, &self.ctx.bundle_id);
         self.announce_device();
         self.ios_supported()?;
+        if self.legacy_ios.is_none() && !self.over_tunnel {
+            self.remember_wifi();
+        }
         if self.legacy_ios.is_some() {
             self.legacy_prepare()?;
         } else {
@@ -671,6 +682,7 @@ impl Setup {
             self.launch_when_port_free(&xcodebuild, &xctestrun, from_cache)?
         };
         self.phone_url = url.clone();
+        self.remember_wifi_address(&url);
         let mut target_url = self.relays(&url)?;
         if self.legacy_ios.is_some() {
             target_url = self.legacy_wifi(&url, &target_url)?;
@@ -920,6 +932,10 @@ impl Setup {
                         self.ctx.udid
                     ));
                     self.over_tunnel = true;
+                } else if self.paired_wifi_available() {
+                    self.direct_wifi = true;
+                    self.over_tunnel = true;
+                    ok("native discovery is unavailable; using the paired Wi-Fi transport");
                 } else {
                     self.phase(
                         "prereq",
@@ -1237,6 +1253,9 @@ impl Setup {
     /// answer never counts as absent. Interactive setup gives up after 10
     /// minutes; KeepAlive waits as long as it takes.
     fn wait_until_connected(&mut self) -> Step {
+        if self.paired_wifi_available() {
+            return Ok(());
+        }
         const POLL: Duration = Duration::from_secs(2);
         const INTERACTIVE_LIMIT: u32 = 300;
         let udid = self.ctx.udid.clone();
@@ -3104,8 +3123,14 @@ impl Setup {
     /// is replaced even under another session's lease. A dead process or a
     /// vanished listener ends the hold at once.
     pub fn hold(&mut self) -> Step {
+        while self.hold_transport()? {}
+        Ok(())
+    }
+
+    /// Hold one transport; a successful switch starts another cycle without recursion.
+    fn hold_transport(&mut self) -> Step<bool> {
         if !self.ctx.keepalive {
-            return Ok(());
+            return Ok(false);
         }
         info("KeepAlive mode: holding while the PID-verified runner and relays stay healthy");
         const MAX_FAILURES: u32 = ProbeCount::MAX;
@@ -3134,6 +3159,21 @@ impl Setup {
         // automation away (see [`runner::log_shows_automation_revoked`]).
         let mut log_mark = self.runner_log_mark;
         let cause = loop {
+            if self.direct_wifi
+                && checks::on_usb(&self.ctx.udid, &checks::usb_udids())
+                && owner::foreign(owner::current(&self.ctx), owner::caller().as_deref()).is_none()
+            {
+                break "usb_switch";
+            }
+            if !self.direct_wifi
+                && self.paired_wifi_available()
+                && !checks::on_usb(&self.ctx.udid, &checks::usb_udids())
+                && !checks::wifi_tunnel(&self.ctx.udid)
+                && !runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark)
+                && owner::foreign(owner::current(&self.ctx), owner::caller().as_deref()).is_none()
+            {
+                break "wifi_switch";
+            }
             // xcodebuild appends to the runner log for as long as the runner
             // lives; it is only truncated at the next launch.
             crate::logcap::cap_file(
@@ -3184,6 +3224,10 @@ impl Setup {
                 Role::Mjpeg,
                 mjpeg_port,
             ) {
+                if self.direct_wifi {
+                    // Both listeners belong to the tunnel/XCTest worker; replace it together.
+                    break "relay";
+                }
                 // The runner is alive: rebuild only the relays, so whoever is
                 // driving the phone keeps its runner and test session. At most
                 // three times in ten minutes; past that, a full rebuild.
@@ -3213,7 +3257,11 @@ impl Setup {
             // lists it, and the runner cannot be started again over Wi-Fi.
             let legacy = self.legacy_ios.is_some();
             let presence = || {
-                if legacy {
+                if self.direct_wifi {
+                    // CoreDevice cannot discover this authenticated transport. Count
+                    // misses so a failed tunnel is retried rather than waiting forever.
+                    checks::Presence::Present
+                } else if legacy {
                     if self.legacy_on_usb() {
                         checks::Presence::Present
                     } else {
@@ -3324,8 +3372,26 @@ impl Setup {
         // hold observed revocation without a confirmed lock. A failed lock
         // probe is inconclusive; a later disconnect must not erase the
         // conservative park and permit automatic reconnect.
-        if cause == "revoked" {
-            return self.park_on_phone(crate::phone_exit::Reason::Exited);
+        if cause == "revoked"
+            || (self.direct_wifi
+                && (runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark)
+                    || wifi_flow::explicitly_finished(&self.ctx.run_log)))
+        {
+            return self
+                .park_on_phone(crate::phone_exit::Reason::Exited)
+                .map(|()| false);
+        }
+        if cause == "wifi_switch" {
+            self.direct_wifi = true;
+            self.start_direct_wifi()?;
+            return Ok(true);
+        }
+        if cause == "usb_switch" {
+            self.stop_transport()?;
+            self.direct_wifi = false;
+            self.over_tunnel = false;
+            self.body()?;
+            return Ok(true);
         }
         // An unplugged phone takes its runner down with it. Nothing can be
         // rebuilt until it is back, so say so and wait instead.
@@ -3352,7 +3418,7 @@ impl Setup {
         if runner::log_shows_lock(&self.ctx.run_log) || self.endpoint_locked()
             || (cause == "runner" && self.passcode_required() == Some(true))
         {
-            return self.locked_retry();
+            return self.locked_retry().map(|()| false);
         }
         // The person held both volume keys: iOS revoked UI automation (the
         // runner lives on, refused), or the runner process ended with the
@@ -3364,7 +3430,7 @@ impl Setup {
             runner::log_shows_connection_invalidated(&self.ctx.run_log, log_mark),
             runner::log_shows_runner_crash(&self.ctx.run_log, log_mark),
         ) {
-            return self.park_on_phone(reason);
+            return self.park_on_phone(reason).map(|()| false);
         }
         match cause {
             "unreachable" => {

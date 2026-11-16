@@ -3446,9 +3446,11 @@ fn idle_release_keeps_wifi_runner(start_refused: bool, transport: &str) -> bool 
 
 /// How control traffic reaches runner, from the relay setup-runner.sh recorded:
 /// `iphone-use relay` (usbmuxd, started only for a USB phone) or a legacy
-/// `iproxy` = USB, `socat` to the phone's address = Wi-Fi.
+/// `iproxy` = USB, `socat` to the phone's address = Wi-Fi, and a paired
+/// `wifi-native serve` worker = an encrypted Wi-Fi tunnel.
 fn runner_transport(state_dir: &std::path::Path) -> &'static str {
     match std::fs::read_to_string(state_dir.join("runner-relay.pid")) {
+        Ok(record) if record.contains("/iphone-use wifi-native serve ") => "wifi-tunnel",
         Ok(record) if record.contains("/iphone-use relay ") || record.contains("iproxy") => "usb",
         Ok(record) if record.contains("socat") => "wifi",
         _ => "unknown",
@@ -29066,6 +29068,21 @@ mod tests {
         std::fs::write(dir.path().join("runner-relay.pid"), "1|now|relay:/Users/u/Applications/iPhoneUse.app/Contents/MacOS/iphone-use relay --udid X --listen 127.0.0.1:8100 --device-port 8100").unwrap();
         assert!(native_relay(dir.path()));
         assert!(transport_hint("wifi-tunnel", Some(40)).unwrap().contains("~40 ms"));
+    }
+
+    /// A paired userspace worker is already a tunnel, even when CoreDevice is absent.
+    #[test]
+    fn paired_wifi_worker_reports_encrypted_transport() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let command = "/tmp/iphone-use wifi-native serve --udid 000000000000000000000001 --state-dir /tmp/instance --runner-port 8100 --mjpeg-port 9100 --bundle-id com.example.runner.xctrunner";
+        std::fs::write(
+            dir.path().join("runner-relay.pid"),
+            format!("1|now|relay:{command}"),
+        )?;
+        assert_eq!(runner_transport(dir.path()), "wifi-tunnel");
+        assert!(!native_relay(dir.path()), "the worker owns its own tunnel");
+        assert!(transport_hint(runner_transport(dir.path()), Some(40)).is_some());
+        Ok(())
     }
 
     #[test]
