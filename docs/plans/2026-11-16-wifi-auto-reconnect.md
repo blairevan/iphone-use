@@ -22,7 +22,7 @@ The native fallback maintains an authenticated TLS-PSK userspace tunnel, starts 
 3. Integrate supervisor fallback and lifetime/PID handling; preserve USB-only policy and foreign owner/private-hold behavior.
 4. Run targeted format/lint and heavy-cargo tests/build. Test real USB bootstrap, unplugged discovery from neighbors, reconnect from cache, forced stale-cache recovery, target identity, and signed Runner readiness. Check Shadowrocket Connected throughout.
 
-Self-review: address discovery alone is insufficient because USB-hosted XCTest exits after unplug. The fallback therefore owns the wireless XCTest session as well as the relay. Successful probes update cache only after RSD confirms the expected UDID. Package support is optional by transport; normal USB/native paths stay available. No commit, PR, or shared-branch edits are authorized by this task.
+Self-review: address discovery alone is insufficient because USB-hosted XCTest exits after unplug. The fallback therefore owns the wireless XCTest session as well as the relay. Successful probes update cache only after RSD confirms the expected UDID. Package support is optional by transport; normal USB/native paths stay available. Initial implementation did not commit. The user later explicitly authorized local Git commit and formal installation; see the delivery record. No PR, push or shared-main update was requested.
 
 ## Completed evidence
 
@@ -41,7 +41,10 @@ Self-review: address discovery alone is insufficient because USB-hosted XCTest e
   server library tests (1 ignored), and executable build.
 
 See [validation details and commands](../wifi-auto-reconnect.md) for acceptance
-boundaries and the current isolated development deployment.
+boundaries and the verified runtime configuration.
+
+The development deployment has now been replaced by the signed local release App;
+see [commit and installation](../commit/2026-11-16-wifi-auto-reconnect-install.md).
 
 ## Network-scoped address memory follow-up
 

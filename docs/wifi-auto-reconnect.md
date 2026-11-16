@@ -118,12 +118,14 @@ other files. Repository-wide formatting has existing drift and was not rewritten
 An iOS dependency-tree check excluded host-side idevice from that target; an iOS
 cross-compilation was not performed.
 
-The tested daemon LaunchAgent runs the isolated worktree's `target/debug/iphone-use`.
-Both daemon and runner LaunchAgents select that setup engine through
-`IPHONE_USE_SETUP_BIN`. Their previous plists were backed up privately before the
-development deployment. Keep the worktree and binary available while using this
-deployment. No commit or push was performed. The on-phone Runner source and desktop
-application bundle were not changed by this feature.
+Initial validation used an isolated debug build. The user subsequently authorized
+Git commit and installation: feature commit `ea776ed` was built with the release
+profile and installed as `~/Applications/iPhoneUse.app` (0.27.34, build 999).
+The daemon, supervisor, native worker and CLI now run from this formal App location;
+both LaunchAgents set `IPHONE_USE_SETUP_BIN` to its executable. No debug process
+remains and no active LaunchAgent references the worktree. Source checkout retention
+is for review and development only. The on-phone Runner source and pairing identity
+were preserved. See [installation record](commit/2026-11-16-wifi-auto-reconnect-install.md).
 
 Recovery is bounded to a saved local hint and at most 32 complete local IPv4
 neighbors. If an address changes and the phone is absent from those candidates,
