@@ -26,12 +26,18 @@ pub struct Target {
 }
 
 impl Target {
+    /// Resolve an explicit instance, or the persisted primary after a rename.
     pub fn resolve(name: Option<&str>) -> Result<Target> {
-        let name = name
+        let mut name = name
             .map(str::to_string)
             .or_else(|| std::env::var("IPHONE_USE_INSTANCE").ok())
             .unwrap_or_default();
         let home = std::env::var("HOME").context("HOME is not set")?;
+        if name.is_empty() {
+            name = core::primary_instance::read_at(std::path::Path::new(&home))
+                .map_err(anyhow::Error::msg)?
+                .unwrap_or_default();
+        }
         let instance = Instance::derive(&name, home, None).map_err(|e| anyhow!(e))?;
         // The same order as the MCP server: explicit environment first, then
         // the daemon's own LaunchAgent.

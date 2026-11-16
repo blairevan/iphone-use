@@ -19,16 +19,16 @@ bad()  { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 FN="$(sed -n '/^install_named_instance() {$/,/^}$/p' "$ROOT/install.sh")"
 [ -n "$FN" ] || bad "install_named_instance not found"
 first_bootout="$(printf '%s\n' "$FN" | grep -n 'launchctl bootout' | head -1 | cut -d: -f1)"
-rollback_def="$(printf '%s\n' "$FN" | grep -n '^    named_rollback() {' | head -1 | cut -d: -f1)"
+rollback_def="$(printf '%s\n' "$FN" | grep -n '^    named_restore() {' | head -1 | cut -d: -f1)"
 [ -n "$rollback_def" ] && [ -n "$first_bootout" ] || bad "missing rollback or bootout"
 [ "$rollback_def" -lt "$first_bootout" ] \
     || bad "named_rollback is defined after the first bootout (line $rollback_def >= $first_bootout)"
 ok_t "named_rollback is defined before the first launchctl bootout"
 
-ok_line="$(printf '%s\n' "$FN" | grep -n 'ok "Instance \$INSTANCE_NAME daemon is up' | cut -d: -f1)"
+ok_line="$(printf '%s\n' "$FN" | grep -n 'ok "Instance \$INSTANCE_NAME installed on port' | cut -d: -f1)"
 # From the old job's bootout (after the rollback body) up to success, a plain
 # `die` would strand a booted-out instance with half-installed files.
-after_def="$(printf '%s\n' "$FN" | awk -v s="$rollback_def" 'NR>s && /^    }$/ {print NR; exit}')"
+after_def="$(printf '%s\n' "$FN" | grep -n '^    shared_app_prepare ' | cut -d: -f1)"
 stray="$(printf '%s\n' "$FN" | sed -n "${after_def},${ok_line}p" | grep -n '[^_]die ' || true)"
 [ -z "$stray" ] || bad "plain die between bootout and success: $stray"
 ok_t "no plain die between the bootout and the success line"

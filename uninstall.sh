@@ -185,8 +185,8 @@ if [ "$INSTANCE_NAME" = default ]; then
     LOG_DIR="$HOME/Library/Logs/iPhoneUse"
     LOG_PARENT="$HOME/Library/Logs"
 else
-    # A named instance owns its own copy of the app and its logs, both inside
-    # its state directory; the shared app, CLI link and logs are untouched.
+    # Keep the legacy private App path for cleanup only. Modern named daemons
+    # use the shared App, which an instance uninstall must never remove.
     DAEMON_LABEL="$INSTANCE_LABEL_PREFIX.$INSTANCE_NAME"
     IPU_RUNNER_LABEL="$INSTANCE_LABEL_PREFIX.runner.$INSTANCE_NAME"
     STATE_DIR="$INSTANCES_DIR/$INSTANCE_NAME"
@@ -203,6 +203,12 @@ LEGACY_DISABLED_PLIST="$LEGACY_PLIST.disabled"
 
 APP_PATH="$APP_PARENT/iPhoneUse.app"
 APP_BINARY="$APP_PATH/Contents/MacOS/iphone-use"
+DAEMON_BINARY="$APP_BINARY"
+SHARED_APP_PATH="$HOME/Applications/iPhoneUse.app"
+if [ "$INSTANCE_NAME" != default ] \
+    && [ "$("$PLISTBUDDY_BIN" -c 'Print :ProgramArguments:0' "$DAEMON_PLIST" 2>/dev/null)" = "$SHARED_APP_PATH/Contents/MacOS/iphone-use" ]; then
+    DAEMON_BINARY="$SHARED_APP_PATH/Contents/MacOS/iphone-use"
+fi
 LEGACY_APP_PATH="$HOME/Applications/iPhoneRemote.app"
 LEGACY_APP_BINARY="$LEGACY_APP_PATH/Contents/MacOS/iphone-remote"
 
@@ -398,7 +404,7 @@ plist_owned() {
     case "$kind" in
         daemon)
             [ "$label" = "$DAEMON_LABEL" ] \
-                && [ "$arg0" = "$APP_BINARY" ] \
+                && [ "$arg0" = "$DAEMON_BINARY" ] \
                 && [ "$arg1" = "serve" ]
             ;;
         runner)
@@ -439,7 +445,7 @@ loaded_job_owned() {
     local snapshot="$2"
     case "$kind" in
         daemon)
-            snapshot_has_exact_value "$snapshot" "$APP_BINARY" \
+            snapshot_has_exact_value "$snapshot" "$DAEMON_BINARY" \
                 && snapshot_has_exact_value "$snapshot" "serve"
             ;;
         runner)
@@ -969,6 +975,9 @@ remove_cli_link() {
 # a failure here is a warning, never a reason to keep the rest.
 remove_agent_mcp_entries() {
     local mcp="$APP_PATH/Contents/MacOS/iphone-use-mcp"
+    if [ "$DAEMON_BINARY" = "$SHARED_APP_PATH/Contents/MacOS/iphone-use" ]; then
+        mcp="$SHARED_APP_PATH/Contents/MacOS/iphone-use-mcp"
+    fi
     local name="iphone-use" existing
     [ "$INSTANCE_NAME" = default ] || name="iphone-use-$INSTANCE_NAME"
     if command -v claude >/dev/null 2>&1 \

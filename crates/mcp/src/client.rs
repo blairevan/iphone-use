@@ -315,10 +315,23 @@ impl DaemonClient {
     /// (`IPHONE_USE_INSTANCE` picks a named one), so an MCP client config
     /// needs no secret: the installer registers the bare command.
     pub fn from_env() -> Self {
+        let primary = if std::env::var("IPHONE_USE_INSTANCE").unwrap_or_default().is_empty() {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            match iu_core::primary_instance::read_at(std::path::Path::new(&home)) {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::error!(%error, "refusing unsafe primary instance selection");
+                    return Self::new("http://127.0.0.1:0", None);
+                }
+            }
+        } else {
+            None
+        };
         let env = |key: &str| {
             std::env::var(key)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
+                .or_else(|| (key == "IPHONE_USE_INSTANCE").then(|| primary.clone()).flatten())
         };
         let (base_url, token) = daemon_target(env, instance_env);
         Self::new(base_url, token)

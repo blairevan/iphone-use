@@ -137,10 +137,13 @@ impl Instance {
     /// with stray whitespace is invalid, not trimmed into a different
     /// instance.
     pub fn from_env() -> Result<Instance, String> {
-        let name = std::env::var("IPHONE_USE_INSTANCE").unwrap_or_default();
+        let mut name = std::env::var("IPHONE_USE_INSTANCE").unwrap_or_default();
         let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() {
             return Err("HOME is not set; cannot derive the instance state dir".into());
+        }
+        if name.is_empty() {
+            name = core::primary_instance::read_at(Path::new(&home))?.unwrap_or_default();
         }
         let state_dir = std::env::var("IPHONE_USE_STATE_DIR")
             .ok()

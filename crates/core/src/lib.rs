@@ -8,6 +8,7 @@ pub mod control;
 pub mod drag;
 pub mod home_layout;
 pub mod env;
+pub mod primary_instance;
 pub mod progress;
 pub mod runner_auth;
 pub mod value_read;

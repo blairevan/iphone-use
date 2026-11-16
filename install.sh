@@ -10,9 +10,9 @@
 # A second phone, driven by its own daemon (#67):
 #   ./install.sh --instance NAME --udid <UDID> [--port N] [/path/to/iPhoneUse.app]
 #   ./install.sh --instance NAME --udid <UDID> /path/to/iPhoneUse.app
-# A named instance gets its own copy of the app, state dir
-# (~/.iphone-use/instances/NAME), launchd labels, token and ports. It never
-# touches the default instance or the shared app; then run its setup-runner.sh.
+# All instances share ~/Applications/iPhoneUse.app. Each keeps its own state
+# (~/.iphone-use/instances/NAME), launchd labels, token and ports. Updating the
+# app restarts previously loaded peers, preserving their enabled/parked state.
 #
 # Requirements:
 #   • Must run as the LOGGED-IN GUI user (not root, not over a bare SSH session).
@@ -94,6 +94,19 @@ MCP_BINARY_INSIDE_APP="Contents/MacOS/iphone-use-mcp"
 # that iOS Simulator after the install (preview); anything else is the
 # optional local app path, as before.
 INSTANCE_NAME="default"
+# A renamed primary instance remains the target of unqualified installs.
+if [ -e "$HOME/.iphone-use/primary-instance" ] || [ -L "$HOME/.iphone-use/primary-instance" ]; then
+    [ -f "$HOME/.iphone-use/primary-instance" ] && [ ! -L "$HOME/.iphone-use/primary-instance" ] \
+        && [ "$(stat -f %u "$HOME/.iphone-use/primary-instance")" = "$(id -u)" ] \
+        && [ "$(stat -f %Lp "$HOME/.iphone-use/primary-instance")" = 600 ] \
+        || { printf 'ERROR: primary instance must be a private owned regular file\n' >&2; exit 2; }
+    INSTANCE_NAME="$(cat "$HOME/.iphone-use/primary-instance")"
+    printf '%s' "$INSTANCE_NAME" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{0,31}$' \
+        || { printf 'ERROR: invalid primary instance\n' >&2; exit 2; }
+    # New phones inherit this Mac's working primary signing policy even when
+    # the legacy default LaunchAgent no longer exists after a rename.
+    RUNNER_SETTINGS_PLIST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.runner.${INSTANCE_NAME}.plist"
+fi
 INSTANCE_UDID=""
 INSTANCE_PORT=""
 INSTALL_ARGS=()
@@ -249,10 +262,206 @@ SKILL_INSTALL_SIGNAL_PENDING=0
 BOOTSTRAP_SIGNAL_PENDING=0
 INSTALL_COMMIT_SIGNAL_PENDING=0
 INSTALL_DAEMON_COMMITTED=0
+SHARED_APP_PEERS=""
+SHARED_APP_PEERS_COMMITTED=0
+SHARED_APP_PEERS_TOUCHED=0
+SHARED_APP_LOCK=""
+NAMED_ROLLBACK_PENDING=0
+
+# Resolve an existing bind address for local health checks, including IPv6.
+daemon_probe_host() {
+    local host="${1:-127.0.0.1}"
+    case "$host" in \[*\]) host="${host#\[}"; host="${host%\]}" ;; esac
+    case "$host" in
+        0.0.0.0) printf '127.0.0.1' ;;
+        ::|0:0:0:0:0:0:0:0) printf '[::1]' ;;
+        *:*) printf '[%s]' "$host" ;;
+        *) printf '%s' "$host" ;;
+    esac
+}
+
+# Refuse to stop a loaded definition that differs from its owned disk plist.
+shared_app_verify_job() {
+    local label="$1" plist="$2" job program expected pid uid command instance
+    local ps_bin="${IPHONE_USE_PS_BIN:-/bin/ps}"
+    job="$(launchctl print "gui/$UID_NUM/$label")" || return 1
+    expected="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist")" || return 1
+    program="$(printf '%s\n' "$job" | sed -n 's/^[[:space:]]*program = //p' | head -1)"
+    [ "$program" = "$expected" ] || return 1
+    pid="$(printf '%s\n' "$job" | sed -nE 's/^[[:space:]]*pid = ([0-9]+).*$/\1/p' | head -1)"
+    printf '%s' "$pid" | grep -Eq '^[0-9]+$' && [ "$pid" -gt 1 ] || return 1
+    uid="$("$ps_bin" -p "$pid" -o uid= | tr -d '[:space:]')" || return 1
+    [ "$uid" = "$UID_NUM" ] || return 1
+    command="$("$ps_bin" -ww -p "$pid" -o command= | sed -E 's/^[[:space:]]*//')" || return 1
+    local arg
+    arg="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$plist")" || return 1
+    if [ "$command" != "$expected $arg" ]; then
+        # The shell supervisor normally execs the native engine in-place.
+        # Its launchd definition remains /bin/bash + the installed shim.
+        [ "$expected" = /bin/bash ] || return 1
+        local engine state_dir
+        state_dir="$(dirname "$arg")"
+        engine="$(plist_env_get_from "$plist" IPHONE_USE_SETUP_BIN)"
+        if [ -z "$engine" ]; then
+            engine="$INSTALL_DIR/$APP_NAME/$BINARY_INSIDE_APP"
+        fi
+        case "$engine" in
+            "$INSTALL_DIR/$APP_NAME/$BINARY_INSIDE_APP"|"$state_dir/runtime/$APP_NAME/$BINARY_INSIDE_APP") ;;
+            *) return 1 ;;
+        esac
+        [ "$command" = "$engine setup-native setup" ] || return 1
+    fi
+    instance="$(plist_env_get_from "$plist" IPHONE_USE_INSTANCE)"
+    if [ -n "$instance" ]; then
+        printf '%s\n' "$job" | awk -v name="$instance" \
+            '$1 == "IPHONE_USE_INSTANCE" && $2 == "=>" && $3 == name {found=1} END {exit(found ? 0 : 1)}' || return 1
+    fi
+}
+
+# Stop only snapshotted, previously loaded peers before changing shared code.
+shared_app_stop_peers() {
+    [ -n "$SHARED_APP_PEERS" ] && [ "$SHARED_APP_PEERS_COMMITTED" = 0 ] || return 0
+    [ "$SHARED_APP_PEERS_TOUCHED" = 1 ] || return 0
+    [ -f "$SHARED_APP_PEERS/jobs" ] || return 0
+    local label plist loaded disabled kind
+    while IFS='|' read -r label plist loaded disabled kind; do
+        [ "$loaded" = 1 ] || continue
+        launchctl bootout "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
+        wait_label_gone "gui/$UID_NUM/$label" || return 1
+        if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then return 1; fi
+    done < "$SHARED_APP_PEERS/jobs"
+}
+
+# Restore a peer's original enablement and loaded state, never resume parked jobs.
+shared_app_start_peers() {
+    [ -n "$SHARED_APP_PEERS" ] || return 0
+    local label plist loaded disabled kind token port host i
+    while IFS='|' read -r label plist loaded disabled kind; do
+        _restore_launchd_job "$label" "$plist" "$loaded" "$disabled" || return 1
+        [ "$loaded" = 1 ] && [ "$kind" = daemon ] || continue
+        port="$(plist_env_get_from "$plist" IPHONE_USE_PORT)"
+        host="$(daemon_probe_host "$(plist_env_get_from "$plist" IPHONE_USE_HOST)")"
+        token="$(plist_env_get_from "$plist" IPHONE_USE_AGENT_TOKEN)"
+        [ -n "$token" ] || token="$(plist_env_get_from "$plist" IPHONE_USE_PASSWORD)"
+        i=0
+        while [ "$i" -lt 30 ]; do
+            probe_launchd_daemon "gui/$UID_NUM/$label" "$INSTALL_DIR/$APP_NAME/$BINARY_INSIDE_APP" \
+                "$port" "http://$host:$port/agent/status" "$token" && break
+            sleep 0.5; i=$((i + 1))
+        done
+        [ "$i" -lt 30 ] || return 1
+    done < "$SHARED_APP_PEERS/jobs"
+}
+
+# Restore plist bytes and runtime after the caller restores the previous App.
+shared_app_restore_peers() {
+    [ -n "$SHARED_APP_PEERS" ] && [ "$SHARED_APP_PEERS_COMMITTED" = 0 ] || return 0
+    [ "$SHARED_APP_PEERS_TOUCHED" = 1 ] || return 0
+    local label plist loaded disabled kind failed=0
+    [ -f "$SHARED_APP_PEERS/jobs" ] || return 0
+    while IFS='|' read -r label plist loaded disabled kind; do
+        if ! cmp -s "$plist" "$SHARED_APP_PEERS/$label.plist" \
+            && ! cmp -s "$plist" "$SHARED_APP_PEERS/$label.new"; then
+            warn "Peer configuration changed concurrently; keeping recovery backup: $plist"
+            failed=1
+            continue
+        fi
+        if ! cp -p "$SHARED_APP_PEERS/$label.plist" "$plist"; then failed=1; continue; fi
+        _restore_launchd_job "$label" "$plist" "$loaded" "$disabled" || failed=1
+    done < "$SHARED_APP_PEERS/jobs"
+    return "$failed"
+}
+
+# Validate/snapshot every other managed instance before a shared App swap.
+# No state files are copied or rewritten: only executable locations change.
+shared_app_prepare() {
+    local exclude="$1" exclude_runner="${2:-}" label plist loaded disabled kind
+    [ ! -L "$HOME/.iphone-use" ] || return 1
+    mkdir -p "$HOME/.iphone-use" "$INSTALL_DIR" || return 1
+    SHARED_APP_LOCK="$HOME/.iphone-use/.shared-app-install-lock"
+    if ! mkdir -m 700 "$SHARED_APP_LOCK" 2>/dev/null; then
+        SHARED_APP_LOCK=""
+        warn "Another shared App install is active (or its lock needs inspection)."
+        return 1
+    fi
+    SHARED_APP_PEERS="$(mktemp -d "$INSTALL_DIR/.iphone-use-peer-backup.XXXXXX")" || return 1
+    # All validation completes before any launchd job or plist is changed.
+    python3 - "$HOME" "$exclude" "$exclude_runner" "$SHARED_APP_PEERS" <<'PY_SHARED'
+import os
+from pathlib import Path
+import plistlib
+import re
+import sys
+
+home, exclude, exclude_runner, backup = sys.argv[1:]
+home, backup = Path(home), Path(backup)
+prefix = 'com.leeguoo.iphone-use'
+shared = str(home / 'Applications/iPhoneUse.app/Contents/MacOS/iphone-use')
+records = []
+for path in sorted((home / 'Library/LaunchAgents').glob(prefix + '*.plist')):
+    label = path.stem
+    if label in (exclude, exclude_runner):
+        continue
+    suffix = label[len(prefix):]
+    runner = suffix == '.runner' or suffix.startswith('.runner.')
+    name = suffix.removeprefix('.runner.').removeprefix('.') if runner else suffix.removeprefix('.')
+    if suffix in ('', '.runner'):
+        name = 'default'
+    elif not re.fullmatch('[a-z][a-z0-9-]{0,31}', name) or name in ('runner', 'wda', 'autoupdate', 'daily-maintenance', 'flow-reverify'):
+        continue
+    meta = path.lstat()
+    if path.is_symlink() or not path.is_file() or meta.st_uid != os.getuid() or meta.st_mode & 0o077:
+        raise RuntimeError('Unsafe peer LaunchAgent: ' + label)
+    raw = path.read_bytes()
+    data = plistlib.loads(raw)
+    env = data.get('EnvironmentVariables', {})
+    if data.get('Label') != label or env.get('IPHONE_USE_INSTANCE', 'default') != name:
+        raise RuntimeError('Peer instance identity mismatch: ' + label)
+    state = home / '.iphone-use' if name == 'default' else home / '.iphone-use/instances' / name
+    args = data.get('ProgramArguments', [])
+    if runner:
+        if args != ['/bin/bash', str(state / 'setup-runner.sh')]:
+            raise RuntimeError('Unexpected peer setup script: ' + label)
+    else:
+        allowed = [shared, str(state / 'runtime/iPhoneUse.app/Contents/MacOS/iphone-use')]
+        if len(args) != 2 or args[0] not in allowed or args[1] != 'serve':
+            raise RuntimeError('Unexpected peer executable: ' + label)
+        data['ProgramArguments'][0] = shared
+    data.setdefault('EnvironmentVariables', {})['IPHONE_USE_SETUP_BIN'] = shared
+    (backup / (label + '.plist')).write_bytes(raw)
+    (backup / (label + '.new')).write_bytes(plistlib.dumps(data))
+    records.append('|'.join([label, str(path), 'runner' if runner else 'daemon']))
+(backup / 'inventory').write_text('\n'.join(records) + ('\n' if records else ''))
+PY_SHARED
+    [ "$?" = 0 ] || return 1
+    LAUNCHD_DISABLED_SNAPSHOT="$(launchctl print-disabled "gui/$UID_NUM")" || return 1
+    : > "$SHARED_APP_PEERS/jobs"
+    while IFS='|' read -r label plist kind; do
+        loaded=0; disabled=0
+        if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+            shared_app_verify_job "$label" "$plist" || return 1
+            loaded=1
+        fi
+        if launchd_label_is_disabled "$label"; then disabled=1; fi
+        printf '%s|%s|%s|%s|%s\n' "$label" "$plist" "$loaded" "$disabled" "$kind" >> "$SHARED_APP_PEERS/jobs"
+    done < "$SHARED_APP_PEERS/inventory"
+    SHARED_APP_PEERS_TOUCHED=1
+    shared_app_stop_peers || return 1
+    while IFS='|' read -r label plist loaded disabled kind; do
+        # A concurrent edit after validation must abort rather than get lost.
+        cmp -s "$plist" "$SHARED_APP_PEERS/$label.plist" || return 1
+        cp -p "$SHARED_APP_PEERS/$label.new" "$plist.new.$$" \
+            && chmod 600 "$plist.new.$$" && mv -f "$plist.new.$$" "$plist" || return 1
+    done < "$SHARED_APP_PEERS/jobs"
+}
 
 _restore_app() {
-    [ "$APP_REPLACED" = "1" ] || return 0
     [ "$APP_COMMITTED" = "0" ] || return 0
+    if [ "$APP_REPLACED" != 1 ]; then
+        # A signal may arrive after moving the old App but before setting the
+        # replacement flag. Detect the completed rename from the filesystem.
+        [ "$APP_HAD_EXISTING" = 1 ] && [ -d "$APP_BACKUP" ] && [ ! -e "$DEST" ] || return 0
+    fi
     if [ "$APP_HAD_EXISTING" = "1" ] && [ -d "$APP_BACKUP" ]; then
         rm -rf "$DEST" 2>/dev/null || true
         if mv "$APP_BACKUP" "$DEST" 2>/dev/null; then
@@ -267,8 +476,10 @@ _restore_app() {
 }
 
 _restore_daemon_plist() {
-    [ "$PLIST_REPLACED" = "1" ] || return 0
     [ "$PLIST_COMMITTED" = "0" ] || return 0
+    if [ "$PLIST_REPLACED" != 1 ]; then
+        [ "$PLIST_HAD_EXISTING" = 1 ] && [ -f "$PLIST_BACKUP" ] && [ ! -e "$PLIST_DST" ] || return 0
+    fi
     if [ "$PLIST_HAD_EXISTING" = "1" ] && [ -f "$PLIST_BACKUP" ]; then
         rm -f "$PLIST_DST" 2>/dev/null || true
         if mv "$PLIST_BACKUP" "$PLIST_DST" 2>/dev/null; then
@@ -697,6 +908,8 @@ _installer_cleanup() {
         status=0
     fi
     if [ "$status" -ne 0 ]; then
+        if [ "$NAMED_ROLLBACK_PENDING" = 1 ]; then named_restore || true; fi
+        shared_app_stop_peers || true
         _restore_skill_state || true
         _restore_daemon_plist
         _restore_old_daemon_plist
@@ -704,10 +917,21 @@ _installer_cleanup() {
         _restore_setup_runner
         _restore_runner_sources
         _restore_app
+        shared_app_restore_peers || true
         _restore_runner_transition || true
         _restore_daemon_runtime
         if [ "$PREINSTALL_MANUAL_DAEMON_STOPPED" = "1" ]; then
             warn "The previously manual daemon was safely stopped for LaunchAgent takeover and was not restarted after rollback. Rerun the installer after fixing the reported error."
+        fi
+    fi
+    if [ -n "$SHARED_APP_LOCK" ]; then
+        rmdir "$SHARED_APP_LOCK" 2>/dev/null || true
+    fi
+    if [ -n "$SHARED_APP_PEERS" ]; then
+        if [ "$SHARED_APP_PEERS_COMMITTED" = 1 ]; then
+            rm -rf "$SHARED_APP_PEERS"
+        else
+            warn "Shared-app recovery records retained at: $SHARED_APP_PEERS"
         fi
     fi
     [ -z "$APP_STAGE" ] || rm -rf "$APP_STAGE" 2>/dev/null || true
@@ -2154,6 +2378,7 @@ _commit_daemon_transaction() {
     # this assignment-only boundary, so an interrupt either precedes every
     # commit flag or follows a fully committed daemon transaction.
     APP_COMMITTED=1
+    SHARED_APP_PEERS_COMMITTED=1
     PLIST_COMMITTED=1
     SETUP_RUNNER_COMMITTED=1
     UNINSTALL_COMMITTED=1
@@ -2354,10 +2579,8 @@ if [ "$SCRIPT_IS_LOCAL" = "0" ]; then
 fi
 
 # ── Named instance (#67) ──────────────────────────────────────────────────────
-# A second phone gets a second daemon. Everything below writes only that
-# instance's plist, its private app copy and its state directory; the default
-# instance's app, plists and runtime are read (signing policy) but never
-# changed. Paths, labels and ports come from setup-runner.sh `instance-context`
+# A second phone gets a second daemon and private data, using the shared App.
+# Paths, labels and ports come from setup-runner.sh `instance-context`
 # (the setup engine in the app being installed).
 # Defined here, before the named-instance install below runs: that path
 # reads its old plist through it.
@@ -2459,13 +2682,16 @@ setup_auto_update() {
 }
 
 install_named_instance() {
-    local app_src="${1:-$INSTALL_DIR/$APP_NAME}"
-    local setup_src="$SCRIPT_DIR/scripts/setup-runner.sh"
-    local uninstall_src="$SCRIPT_DIR/uninstall.sh"
-    local default_runner_plist="$RUNNER_SETTINGS_PLIST"
-    local ctx state_dir label plist runner_label daemon_port runner_port mjpeg_port udid
-    local runtime app_dst app_stage app_backup="" plist_stage plist_backup=""
-    local binary token key value probe code i was_loaded=0
+    # EXIT traps run after function locals unwind. Keep the rollback context
+    # in the installer process, rather than capturing short-lived locals.
+    app_src="${1:-$INSTALL_DIR/$APP_NAME}"
+    setup_src="$SCRIPT_DIR/scripts/setup-runner.sh"
+    uninstall_src="$SCRIPT_DIR/uninstall.sh"
+    default_runner_plist="$RUNNER_SETTINGS_PLIST"
+    ctx=""; state_dir=""; label=""; plist=""; runner_label=""
+    daemon_port=""; runner_port=""; mjpeg_port=""; udid=""
+    runtime=""; app_dst=""; app_stage=""; app_backup=""; plist_stage=""; plist_backup=""
+    binary=""; token=""; key=""; value=""; probe=""; code=""; i=0; was_loaded=0; was_disabled=0
     local -a env_keys env_values
 
     [ "$SCRIPT_IS_LOCAL" = "1" ] \
@@ -2514,20 +2740,21 @@ install_named_instance() {
     retire_pre_rename_runner "$state_dir" "${PLIST_LABEL}.wda.$INSTANCE_NAME" "$runner_label" \
         || die "Instance $INSTANCE_NAME: the pre-rename runner supervisor could not be migrated."
 
-    runtime="$state_dir/runtime"
-    app_dst="$runtime/$APP_NAME"
+    runtime="$INSTALL_DIR"
+    app_dst="$INSTALL_DIR/$APP_NAME"
     binary="$app_dst/$BINARY_INSIDE_APP"
     local first_install=1
     [ ! -f "$plist" ] || first_install=0
     if [ -f "$plist" ]; then
         [ ! -L "$plist" ] || die "Refusing symlinked plist: $plist"
+        local previous_binary
+        previous_binary="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null)"
         [ "$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null)" = "$label" ] \
-            && [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null)" = "$binary" ] \
+            && { [ "$previous_binary" = "$binary" ] || [ "$previous_binary" = "$state_dir/runtime/$APP_NAME/$BINARY_INSIDE_APP" ]; } \
             || die "$plist exists but is not this installer's instance $INSTANCE_NAME; refusing to overwrite it."
     fi
 
-    # The app: a verified copy, private to the instance, so the default
-    # instance's upgrades never swap the binary under this daemon.
+    # Stage a verified shared App; all loaded consumers join its transaction.
     [ -d "$app_src" ] && [ ! -L "$app_src" ] || die "App not found: $app_src (install the default instance first, or pass an app path)."
     [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_src/Contents/Info.plist" 2>/dev/null)" = "$BUNDLE_ID" ] \
         || die "$app_src is not $BUNDLE_ID."
@@ -2560,6 +2787,7 @@ install_named_instance() {
     token="$(pick IPHONE_USE_AGENT_TOKEN)"
     [ -n "$token" ] || token="$(openssl rand -hex 32)" || die "Could not generate an agent token."
     add_env IPHONE_USE_INSTANCE "$INSTANCE_NAME"
+    add_env IPHONE_USE_SETUP_BIN "$binary"
     # The daemon keeps its pid record and session secret under $TMPDIR; daemons
     # up to v0.10.12 used one directory per user, so a second daemon saw the
     # first one's pid and refused to start. A private TMPDIR keeps them apart
@@ -2615,7 +2843,8 @@ install_named_instance() {
         fi
     done
 
-    # Stage everything, then stop this instance's daemon (only it) and swap.
+    # Stage everything before stopping any shared-App consumer.
+    mkdir -p "$INSTALL_DIR" || die "Could not create $INSTALL_DIR"
     app_stage="$runtime/.$APP_NAME.new.$$"
     rm -rf "$app_stage"
     ditto "$app_src" "$app_stage" || die "Could not copy $app_src"
@@ -2649,9 +2878,14 @@ install_named_instance() {
     # exactly the steps that already happened.
     app_replaced=0
     plist_replaced=0
-    named_rollback() {
-        warn "Rolling back instance $INSTANCE_NAME: $1"
+    helper_backup="$(mktemp -d "$state_dir/.install-helpers.XXXXXX")"
+    for value in setup-runner.sh uninstall.sh; do
+        [ ! -f "$state_dir/$value" ] || cp -p "$state_dir/$value" "$helper_backup/$value"
+    done
+    named_restore() {
+        NAMED_ROLLBACK_PENDING=0
         _restore_runner_sources
+        shared_app_stop_peers || true
         launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
         wait_label_gone "gui/$UID_NUM/$label"
         if [ "$plist_replaced" = 1 ]; then
@@ -2659,29 +2893,52 @@ install_named_instance() {
         fi
         if [ "$app_replaced" = 1 ]; then rm -rf "$app_dst"; fi
         if [ -n "$app_backup" ] && [ -d "$app_backup" ]; then mv "$app_backup" "$app_dst"; fi
-        if [ "$was_loaded" = 1 ] && [ -f "$plist" ]; then
-            launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null || true
-        fi
+        for value in setup-runner.sh uninstall.sh; do
+            if [ -f "$helper_backup/$value" ]; then
+                cp -p "$helper_backup/$value" "$state_dir/$value" || return 1
+            else
+                rm -f "$state_dir/$value"
+            fi
+        done
+        local failed=0
+        shared_app_restore_peers || failed=1
+        if [ "$failed" = 0 ]; then SHARED_APP_PEERS_COMMITTED=1; fi
+        _restore_launchd_job "$label" "$plist" "$was_loaded" "$was_disabled" || failed=1
+        return "$failed"
+    }
+    named_rollback() {
+        warn "Rolling back instance $INSTANCE_NAME: $1"
         die "$1"
     }
 
+    LAUNCHD_DISABLED_SNAPSHOT="$(launchctl print-disabled "gui/$UID_NUM")" \
+        || named_rollback "Could not snapshot launchd disabled states."
+    if launchd_label_is_disabled "$label"; then was_disabled=1; fi
     if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+        shared_app_verify_job "$label" "$plist" || named_rollback "Loaded instance identity differs from its plist."
         was_loaded=1
+    fi
+    shared_app_prepare "$label" || named_rollback "Could not prepare shared App consumers."
+    NAMED_ROLLBACK_PENDING=1
+    if [ "$was_loaded" = 1 ]; then
         launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
         wait_label_gone "gui/$UID_NUM/$label"
+        if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+            named_rollback "Instance daemon did not stop."
+        fi
     fi
     if [ -d "$app_dst" ]; then
         app_backup="$runtime/.$APP_NAME.backup.$$"
         mv "$app_dst" "$app_backup" || { app_backup=""; named_rollback "Could not move the previous instance app aside."; }
     fi
-    mv "$app_stage" "$app_dst" || named_rollback "Could not install the instance app."
     app_replaced=1
+    mv "$app_stage" "$app_dst" || named_rollback "Could not install the instance app."
     if [ -f "$plist" ]; then
         plist_backup="$plist_stage.backup"
         cp -p "$plist" "$plist_backup" || named_rollback "Could not back up $plist"
     fi
-    mv -f "$plist_stage" "$plist" || named_rollback "Could not install $plist"
     plist_replaced=1
+    mv -f "$plist_stage" "$plist" || named_rollback "Could not install $plist"
     for value in setup-runner.sh uninstall.sh; do
         if [ "$value" = setup-runner.sh ]; then key="$setup_src"; else key="$uninstall_src"; fi
         cp -f "$key" "$state_dir/$value.new.$$" && chmod 700 "$state_dir/$value.new.$$" \
@@ -2695,26 +2952,41 @@ install_named_instance() {
         warn "No device runner sources next to this installer or at $RUNNER_SRC_DST; install the default instance first."
     fi
 
-    launchctl enable "gui/$UID_NUM/$label" 2>/dev/null || true
-    launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null \
-        || named_rollback "launchctl refused $plist"
+    if [ "$first_install" = 1 ] || [ "$was_loaded" = 1 ]; then
+        launchctl enable "gui/$UID_NUM/$label" 2>/dev/null \
+            || named_rollback "Could not enable $label"
+        launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null \
+            || named_rollback "launchctl refused $plist"
     # The daemon must be OUR process (launchd pid running this binary, owning
     # the listener) and answer an authenticated /agent/status with 200 — a
     # stray process on the port or a crash-looping job must not pass.
     i=0
     while [ "$i" -lt 40 ]; do
         probe_launchd_daemon "gui/$UID_NUM/$label" "$binary" "$daemon_port" \
-            "http://127.0.0.1:$daemon_port/agent/status" "$token" && break
+            "http://$(daemon_probe_host "$(pick IPHONE_USE_HOST)"):$daemon_port/agent/status" "$token" && break
         sleep 0.5; i=$((i + 1))
     done
     [ "$i" -lt 40 ] \
         || named_rollback "the instance daemon did not prove its PID, listener and a 200 /agent/status on 127.0.0.1:$daemon_port (see $state_dir/logs/iphone-use.err)"
+    fi
+    if [ "$was_disabled" = 1 ]; then
+        launchctl disable "gui/$UID_NUM/$label" || named_rollback "Could not restore disabled state"
+    fi
+    shared_app_start_peers || named_rollback "A shared App consumer failed readiness verification."
+    INSTALL_COMMIT_SIGNAL_PENDING=0
+    trap 'INSTALL_COMMIT_SIGNAL_PENDING=1' HUP INT TERM
+    [ "$INSTALL_COMMIT_SIGNAL_PENDING" = 0 ] || exit 130
+    SHARED_APP_PEERS_COMMITTED=1
+    NAMED_ROLLBACK_PENDING=0
+    RUNNER_SRC_COMMITTED=1
+    INSTALL_DAEMON_COMMITTED=1
+    trap 'exit 130' HUP INT TERM
+    rm -rf "$helper_backup"
     [ -z "$app_backup" ] || rm -rf "$app_backup"
     [ -z "$plist_backup" ] || rm -f "$plist_backup"
-    RUNNER_SRC_COMMITTED=1
     _finish_runner_sources
 
-    ok "Instance $INSTANCE_NAME daemon is up on http://127.0.0.1:$daemon_port"
+    ok "Instance $INSTANCE_NAME installed on port $daemon_port (previous runtime state preserved)"
     echo ""
     info "iPhone      : $udid"
     info "Daemon      : http://127.0.0.1:$daemon_port   (launchd $label)"
@@ -3072,6 +3344,12 @@ ok "Bundle-id verified: $BUNDLE_ID"
 codesign --verify --deep --strict "$APP_STAGE" 2>/dev/null \
     || die "Staged app failed code-signature verification."
 
+if [ "$PREINSTALL_DAEMON_LOADED" = 1 ]; then
+    shared_app_verify_job "$PLIST_LABEL" "$PLIST_DST" \
+        || die "Loaded default daemon differs from its owned plist."
+fi
+shared_app_prepare "$PLIST_LABEL" "$IPU_RUNNER_PLIST_LABEL" \
+    || die "Could not prepare shared App consumers."
 if [ -d "$DEST" ]; then
     APP_HAD_EXISTING=1
     APP_BACKUP="$(mktemp -d "$INSTALL_DIR/.${APP_NAME}.backup.XXXXXX")"
@@ -3497,7 +3775,7 @@ ok "LaunchAgent plist written: $PLIST_DST"
 # backups, so a failure here restores the previous install.
 if [ "$PRODUCT_RUNNER_SUPERVISOR_OWNED" = "1" ] \
     && [ "$IPU_RUNNER_MANAGED" = "true" ]; then
-    if [ "$PREINSTALL_RUNNER_DISABLED" = "1" ] && [ "${IDLE_RELEASE_SECS:-}" != "0" ]; then
+    if [ "$PREINSTALL_RUNNER_DISABLED" = "1" ]; then
         # A disabled supervisor in Direct mode is a released phone, parked on
         # purpose. Enabling it here made the next login start the runner, and
         # iOS then asked for the passcode on a phone nobody had asked for. The
@@ -3518,6 +3796,9 @@ fi
 # explains the missing prerequisite and offers recovery. Keep the product
 # reachable instead of turning setup state into a connection-refused page.
 DAEMON_SHOULD_START=1
+if [ "$PLIST_HAD_EXISTING" = 1 ] && [ "$PREINSTALL_DAEMON_LOADED" = 0 ]; then
+    DAEMON_SHOULD_START=0
+fi
 IPU_RUNNER_READY=0
 if command -v curl >/dev/null 2>&1 \
     && curl -fsS --noproxy '*' -m 4 "${IPU_RUNNER_URL%/}/status" >/dev/null 2>&1; then
@@ -3608,8 +3889,11 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.5
 done
 
-# Enable the job definition before bootstrapping it.
-if launchctl enable "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null; then
+# Preserve a stopped/disabled existing daemon, while starting a new install.
+if [ "$DAEMON_SHOULD_START" = 0 ] && [ "$PREINSTALL_DAEMON_DISABLED" = 1 ]; then
+    launchctl disable "gui/$UID_NUM/$PLIST_LABEL" \
+        || die "Could not preserve the disabled daemon state."
+elif launchctl enable "gui/$UID_NUM/$PLIST_LABEL" 2>/dev/null; then
     ok "LaunchAgent enabled (persists across reboots)"
 else
     die "Could not enable the new LaunchAgent; the previous install and daemon state were restored."
@@ -3644,18 +3928,16 @@ if [ "$DAEMON_SHOULD_START" = "1" ]; then
         fi
     fi
 fi
+DAEMON_HTTP_READY=0
+DAEMON_PRODUCT_READY=0
+if [ "$DAEMON_SHOULD_START" = 1 ]; then
 [ "$DAEMON_LOADED" = "1" ] \
     || die "The new LaunchAgent was not loaded; the previous install and daemon state were restored."
 
 # A loaded KeepAlive job can still be crash-looping or unable to bind its port.
 # The browser control plane is designed to work while runner is offline, so
 # require that local HTTP endpoint before discarding the previous install.
-case "$HOST" in
-    0.0.0.0) DAEMON_PROBE_HOST="127.0.0.1" ;;
-    "::"|"0:0:0:0:0:0:0:0") DAEMON_PROBE_HOST="[::1]" ;;
-    *:*) DAEMON_PROBE_HOST="[$HOST]" ;;
-    *) DAEMON_PROBE_HOST="$HOST" ;;
-esac
+DAEMON_PROBE_HOST="$(daemon_probe_host "$HOST")"
 DAEMON_PROBE_URL="http://${DAEMON_PROBE_HOST}:${PORT}/"
 DAEMON_HTTP_READY=0
 DAEMON_PID=""
@@ -3707,11 +3989,19 @@ if [ "$IPU_RUNNER_READY" = "1" ] \
         || die "The device runner answered before install, but the restarted daemon did not report drivable=true within 15s; the previous install and daemon state were restored. Inspect $LOG_DIR."
     ok "Daemon product status verified: drivable=true"
 fi
+if [ "$PREINSTALL_DAEMON_DISABLED" = 1 ]; then
+    launchctl disable "gui/$UID_NUM/$PLIST_LABEL" \
+        || die "Could not preserve the disabled daemon state."
+fi
+else
+    ok "Existing daemon remains unloaded; its original enabled state is preserved"
+fi
 
 # Commit only after launchd accepts the new definition and the local HTTP
 # control plane answers. runner may still be a first-run prerequisite, but a
 # broken daemon bootstrap/control plane is an install failure and must never
 # be reported as success.
+shared_app_start_peers || die "A shared App consumer failed readiness verification."
 INSTALL_COMMIT_SIGNAL_PENDING=0
 trap 'INSTALL_COMMIT_SIGNAL_PENDING=1' HUP INT TERM
 _verify_skill_before_daemon_commit
@@ -3836,7 +4126,11 @@ if [ "$DAEMON_HTTP_READY" = "1" ] \
     && [ "$DAEMON_PRODUCT_READY" = "1" ]; then
     ok "Installed; the daemon and the device runner are up, and the iPhone is drivable."
 else
-    ok "Installed; daemon HTTP control plane verified."
+    if [ "$DAEMON_HTTP_READY" = 1 ]; then
+        ok "Installed; daemon HTTP control plane verified."
+    else
+        ok "Installed; existing daemon remains unloaded."
+    fi
     if [ "$IPU_RUNNER_MANAGED" = "true" ]; then
         info "The device runner is parked or not set up yet."
     fi

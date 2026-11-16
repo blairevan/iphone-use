@@ -244,13 +244,18 @@ fn plist_env(
 /// and renewal remain with the chosen HTTPS terminator; no new cloud service,
 /// certificate authority, firewall rule or public listener is silently created.
 pub fn run(action: Action) -> Result<()> {
-    let name = match &action {
+    let mut name = match &action {
         Action::Status { instance }
         | Action::Enable { instance, .. }
         | Action::Disable { instance, .. } => instance.clone(),
     }
-    .unwrap_or_else(|| std::env::var("IPHONE_USE_INSTANCE").unwrap_or_else(|_| "default".into()));
+    .unwrap_or_else(|| std::env::var("IPHONE_USE_INSTANCE").unwrap_or_default());
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    if name.is_empty() {
+        name = core::primary_instance::read_at(&home)
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_default();
+    }
     let instance =
         crate::instance::Instance::derive(&name, home, None).map_err(anyhow::Error::msg)?;
     instance.verify_on_disk().map_err(anyhow::Error::msg)?;

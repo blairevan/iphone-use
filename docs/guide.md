@@ -681,7 +681,9 @@ named instance for it; the default install is left exactly as it is:
 iphone-use setup --instance lab                # what the installer runs when that phone is plugged in
 ```
 
-The instance gets its own copy of the app, state directory
+All instances use the same `~/Applications/iPhoneUse.app`. An App update restarts
+previously loaded consumers and preserves each job's enabled/parked state; an
+unhealthy consumer rolls the shared update back. Each instance gets its own state directory
 (`~/.iphone-use/instances/lab`, including its own runner build products under
 `runner-build/`; the sources at `~/.iphone-use/runner` are shared), launchd labels (`com.leeguoo.iphone-use.lab`,
 `com.leeguoo.iphone-use.runner.lab`), loopback-only daemon, agent token and ports. Ports

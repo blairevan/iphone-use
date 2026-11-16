@@ -100,6 +100,14 @@ for _legacy in $(env | sed -n 's/^WDA_\([A-Z0-9_][A-Z0-9_]*\)=.*/\1/p'); do
 done
 unset _legacy
 REQUESTED="${IPHONE_USE_INSTANCE-}"
+if [ -z "$REQUESTED" ] && [ -z "$INSTALLED" ] \
+    && { [ -e "$HOME/.iphone-use/primary-instance" ] || [ -L "$HOME/.iphone-use/primary-instance" ]; }; then
+    [ -f "$HOME/.iphone-use/primary-instance" ] && [ ! -L "$HOME/.iphone-use/primary-instance" ] \
+        && [ "$(stat -f %u "$HOME/.iphone-use/primary-instance")" = "$(id -u)" ] \
+        && [ "$(stat -f %Lp "$HOME/.iphone-use/primary-instance")" = 600 ] \
+        || { printf 'unsafe primary instance marker\n' >&2; exit 2; }
+    REQUESTED="$(cat "$HOME/.iphone-use/primary-instance")"
+fi
 [ -n "$REQUESTED" ] || REQUESTED="${INSTALLED:-default}"
 if [ -n "$INSTALLED" ] && [ "$INSTALLED" != "$REQUESTED" ] \
     && [ -z "${IPHONE_USE_STATE_DIR:-}" ]; then
@@ -114,8 +122,8 @@ if [ -n "$INSTALLED" ] && [ "$INSTALLED" != "$REQUESTED" ] \
 fi
 export IPHONE_USE_INSTANCE="$REQUESTED"
 
-# The binary: the daemon this instance runs (a named instance has its own
-# runtime copy), then the standard app locations. It must implement the
+# The binary: the shared App selected by this instance, then the standard
+# app locations. It must implement the
 # command (`setup-native --supports`).
 if [ "$REQUESTED" = default ]; then
     DAEMON_PLIST="$HOME/Library/LaunchAgents/com.leeguoo.iphone-use.plist"

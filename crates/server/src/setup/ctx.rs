@@ -671,7 +671,11 @@ pub fn other_instance_plists(ctx: &Ctx) -> Vec<(String, PathBuf)> {
 /// instance's built-in defaults, which an older plist may leave implicit.
 pub fn claimed_ports(ctx: &Ctx) -> Vec<u32> {
     let mut ports = Vec::new();
-    if !ctx.instance.is_default() {
+    let renamed_primary = core::primary_instance::read_at(&ctx.home).ok().flatten().is_some();
+    if !ctx.instance.is_default()
+        && (ctx.home.join("Library/LaunchAgents/com.leeguoo.iphone-use.plist").is_file()
+            || !renamed_primary)
+    {
         ports.extend([44321, 8100, 9100]);
     }
     for (_, plist) in other_instance_plists(ctx) {
@@ -876,6 +880,39 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A renamed primary retains its original ports; other phones still see them.
+    #[test]
+    fn renamed_primary_retains_legacy_ports() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let home = root.path();
+        std::fs::create_dir_all(home.join(".iphone-use"))?;
+        let marker = home.join(".iphone-use/primary-instance");
+        std::fs::write(&marker, "i16\n")?;
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))?;
+        let instance = Instance::derive("i16", home, None)?;
+        let ctx = Ctx::paths(instance);
+        assert!(!claimed_ports(&ctx).contains(&44321));
+        let agents = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents)?;
+        let config = plist::Value::Dictionary(plist::Dictionary::from_iter([
+            ("Label".to_string(), plist::Value::String("com.leeguoo.iphone-use.i16".into())),
+            ("EnvironmentVariables".to_string(), plist::Value::Dictionary(plist::Dictionary::from_iter([
+                ("IPHONE_USE_PORT".to_string(), plist::Value::String("44321".into())),
+                ("IPU_RUNNER_PORT".to_string(), plist::Value::String("8100".into())),
+                ("MJPEG_PORT".to_string(), plist::Value::String("9100".into())),
+            ]))),
+        ]));
+        config.to_file_xml(agents.join("com.leeguoo.iphone-use.i16.plist"))?;
+        let peer = Ctx::paths(Instance::derive("i12", home, None)?);
+        for port in [44321, 8100, 9100] {
+            assert!(claimed_ports(&peer).contains(&port));
+        }
+        std::fs::write(marker, "invalid primary\n")?;
+        assert!(claimed_ports(&ctx).contains(&44321));
+        Ok(())
+    }
 
     #[test]
     fn notice_permission_is_explicit_and_survives_supervisor_configuration() {
